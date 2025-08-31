@@ -2,6 +2,7 @@
 const express = require('express');
 const router = express.Router();
 const bcrypt = require('bcryptjs');
+const mongoose = require('mongoose');
 const { 
   User, 
   AgentStore, 
@@ -69,6 +70,173 @@ router.get('/users', asyncHandler(async (req, res) => {
         page: parseInt(page),
         pages: Math.ceil(total / limit),
         limit: parseInt(limit)
+      }
+    }
+  });
+}));
+
+// @route   GET /api/admin/users/:userId/purchases
+// @desc    Get all purchases for a specific user
+// @access  Admin
+router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
+  const { userId } = req.params;
+  const { 
+    todayOnly = 'false',
+    network,
+    status,
+    startDate,
+    endDate,
+    page = 1,
+    limit = 50,
+    sortBy = 'createdAt',
+    order = 'desc'
+  } = req.query;
+
+  // Verify user exists
+  const user = await User.findById(userId);
+  if (!user) {
+    return res.status(404).json({
+      success: false,
+      message: 'User not found'
+    });
+  }
+
+  // Build filter - Use 'new' when creating ObjectId
+  const filter = { userId: new mongoose.Types.ObjectId(userId) };
+  
+  // Add date filter based on todayOnly flag
+  if (todayOnly === 'true') {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    filter.createdAt = {
+      $gte: today,
+      $lt: tomorrow
+    };
+  } else if (startDate || endDate) {
+    // Custom date range
+    filter.createdAt = {};
+    if (startDate) filter.createdAt.$gte = new Date(startDate);
+    if (endDate) filter.createdAt.$lte = new Date(endDate);
+  }
+
+  // Add other filters
+  if (network) filter.network = network;
+  if (status) filter.status = status;
+
+  // Fetch purchases
+  const purchases = await DataPurchase.find(filter)
+    .populate('agentId', 'name email')
+    .sort({ [sortBy]: order === 'desc' ? -1 : 1 })
+    .limit(limit * 1)
+    .skip((page - 1) * limit);
+
+  const total = await DataPurchase.countDocuments(filter);
+
+  // Calculate statistics
+  const stats = await DataPurchase.aggregate([
+    { $match: { userId: new mongoose.Types.ObjectId(userId) } },
+    {
+      $group: {
+        _id: null,
+        totalAmount: { $sum: '$price' },
+        totalPurchases: { $sum: 1 },
+        avgPurchaseValue: { $avg: '$price' },
+        totalCapacity: { $sum: '$capacity' }
+      }
+    }
+  ]);
+
+  // Get breakdown by network
+  const networkBreakdown = await DataPurchase.aggregate([
+    { $match: { userId: new mongoose.Types.ObjectId(userId) } },
+    {
+      $group: {
+        _id: '$network',
+        count: { $sum: 1 },
+        totalAmount: { $sum: '$price' },
+        totalCapacity: { $sum: '$capacity' }
+      }
+    },
+    { $sort: { totalAmount: -1 } }
+  ]);
+
+  // Get breakdown by status
+  const statusBreakdown = await DataPurchase.aggregate([
+    { $match: { userId: new mongoose.Types.ObjectId(userId) } },
+    {
+      $group: {
+        _id: '$status',
+        count: { $sum: 1 },
+        totalAmount: { $sum: '$price' }
+      }
+    }
+  ]);
+
+  // Get today's stats if not filtering by today only
+  let todayStats = null;
+  if (todayOnly !== 'true') {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    
+    todayStats = await DataPurchase.aggregate([
+      {
+        $match: {
+          userId: new mongoose.Types.ObjectId(userId),
+          createdAt: { $gte: today, $lt: tomorrow }
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          todayTotal: { $sum: '$price' },
+          todayCount: { $sum: 1 }
+        }
+      }
+    ]);
+  }
+
+  res.status(200).json({
+    success: true,
+    data: {
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        role: user.role,
+        walletBalance: user.walletBalance
+      },
+      purchases,
+      statistics: {
+        overall: stats[0] || {
+          totalAmount: 0,
+          totalPurchases: 0,
+          avgPurchaseValue: 0,
+          totalCapacity: 0
+        },
+        today: todayOnly === 'true' ? null : (todayStats?.[0] || {
+          todayTotal: 0,
+          todayCount: 0
+        }),
+        byNetwork: networkBreakdown || [],
+        byStatus: statusBreakdown || []
+      },
+      pagination: {
+        total,
+        page: parseInt(page),
+        pages: Math.ceil(total / limit),
+        limit: parseInt(limit)
+      },
+      filters: {
+        todayOnly: todayOnly === 'true',
+        network,
+        status,
+        dateRange: startDate || endDate ? { startDate, endDate } : null
       }
     }
   });
@@ -242,7 +410,188 @@ router.put('/users/:userId/parent', [
   });
 }));
 
+// @route   PUT /api/admin/users/:userId/api-access
+// @desc    Enable/disable API access for user
+// @access  Admin
+router.put('/users/:userId/api-access', [
+  body('enabled').isBoolean(),
+  body('tier').optional().isIn(['basic', 'premium', 'enterprise']),
+  body('rateLimit').optional().isNumeric().isInt({ min: 1, max: 10000 }),
+  validate
+], asyncHandler(async (req, res) => {
+  const { userId } = req.params;
+  const { enabled, tier = 'basic', rateLimit = 100 } = req.body;
+
+  const user = await User.findById(userId);
+  if (!user) {
+    return res.status(404).json({
+      success: false,
+      message: 'User not found'
+    });
+  }
+
+  // Update API access settings
+  user.apiAccess = {
+    enabled,
+    tier: enabled ? tier : user.apiAccess?.tier || 'basic',
+    rateLimit: enabled ? rateLimit : user.apiAccess?.rateLimit || 100
+  };
+
+  await user.save();
+
+  // If enabling API access, check if user has an API key
+  let apiKey = null;
+  if (enabled) {
+    apiKey = await ApiKey.findOne({ userId: user._id, isActive: true });
+    
+    // Create a new API key if none exists
+    if (!apiKey) {
+      const crypto = require('crypto');
+      const keyString = `sk_${crypto.randomBytes(32).toString('hex')}`;
+      
+      apiKey = new ApiKey({
+        userId: user._id,
+        key: keyString,
+        name: `Default API Key for ${user.name}`,
+        description: 'Auto-generated API key',
+        permissions: tier === 'enterprise' 
+          ? ['read:all', 'write:all'] 
+          : tier === 'premium'
+          ? ['read:products', 'write:purchases', 'read:transactions', 'read:balance']
+          : ['read:products', 'write:purchases'],
+        rateLimit: {
+          requests: rateLimit,
+          period: '1m'
+        },
+        isActive: true
+      });
+      
+      await apiKey.save();
+    }
+  } else {
+    // Disable all API keys when disabling API access
+    await ApiKey.updateMany(
+      { userId: user._id },
+      { isActive: false }
+    );
+  }
+
+  // Send notification to user
+  await Notification.create({
+    userId: user._id,
+    title: enabled ? 'API Access Enabled' : 'API Access Disabled',
+    message: enabled 
+      ? `Your API access has been enabled with ${tier} tier (${rateLimit} requests/minute)`
+      : 'Your API access has been disabled',
+    type: 'info',
+    category: 'account'
+  });
+
+  res.status(200).json({
+    success: true,
+    message: `API access ${enabled ? 'enabled' : 'disabled'} successfully`,
+    data: {
+      userId: user._id,
+      apiAccess: user.apiAccess,
+      apiKey: enabled && apiKey ? {
+        id: apiKey._id,
+        key: apiKey.key.substring(0, 10) + '...',
+        name: apiKey.name
+      } : null
+    }
+  });
+}));
+
 // ==================== PRICING & INVENTORY MANAGEMENT ====================
+
+// @route   GET /api/admin/pricing
+// @desc    Get all pricing data with filters
+// @access  Admin
+router.get('/pricing', asyncHandler(async (req, res) => {
+  const { 
+    network, 
+    capacity, 
+    inStockOnly, 
+    isActive = 'true',
+    sortBy = 'network',
+    order = 'asc' 
+  } = req.query;
+
+  // Build filter
+  const filter = {};
+  
+  if (network) filter.network = network;
+  if (capacity) filter.capacity = parseFloat(capacity);
+  if (isActive !== undefined) filter.isActive = isActive === 'true';
+  
+  if (inStockOnly === 'true') {
+    filter['stock.overallInStock'] = true;
+  }
+
+  try {
+    // Fetch pricing data
+    const pricingData = await DataPricing.find(filter)
+      .populate('lastUpdatedBy', 'name email')
+      .sort({ [sortBy]: order === 'desc' ? -1 : 1 });
+
+    // Get statistics
+    const stats = {
+      total: pricingData.length,
+      inStock: pricingData.filter(p => p.stock?.overallInStock).length,
+      outOfStock: pricingData.filter(p => !p.stock?.overallInStock).length,
+      webInStock: pricingData.filter(p => p.stock?.webInStock).length,
+      apiInStock: pricingData.filter(p => p.stock?.apiInStock).length,
+      popular: pricingData.filter(p => p.isPopular).length
+    };
+
+    // Calculate average margins
+    const margins = pricingData.map(p => {
+      const adminCost = p.prices.adminCost;
+      const userPrice = p.prices.user;
+      return ((userPrice - adminCost) / adminCost) * 100;
+    });
+    
+    stats.avgMargin = margins.length > 0 
+      ? (margins.reduce((a, b) => a + b, 0) / margins.length).toFixed(2)
+      : 0;
+
+    res.status(200).json({
+      success: true,
+      data: pricingData,
+      stats,
+      count: pricingData.length
+    });
+  } catch (error) {
+    console.error('Error fetching pricing:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch pricing data',
+      error: error.message
+    });
+  }
+}));
+
+// @route   GET /api/admin/pricing/:id
+// @desc    Get single pricing item
+// @access  Admin
+router.get('/pricing/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const pricing = await DataPricing.findById(id)
+    .populate('lastUpdatedBy', 'name email');
+
+  if (!pricing) {
+    return res.status(404).json({
+      success: false,
+      message: 'Pricing not found'
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    data: pricing
+  });
+}));
 
 // @route   POST /api/admin/pricing
 // @desc    Create or update pricing for a product
@@ -291,9 +640,9 @@ router.post('/pricing', [
       tags,
       lastUpdatedBy: req.user._id,
       stock: {
-        webInStock: true,  // Default to in stock
-        apiInStock: true,  // Default to in stock
-        overallInStock: true  // Default to in stock
+        webInStock: true,
+        apiInStock: true,
+        overallInStock: true
       },
       isActive: true
     });
@@ -308,9 +657,9 @@ router.post('/pricing', [
     // Create new inventory record for this network
     inventory = new DataInventory({
       network,
-      webInStock: true,  // Default to in stock
-      apiInStock: true,  // Default to in stock
-      inStock: true,     // Default to in stock
+      webInStock: true,
+      apiInStock: true,
+      inStock: true,
       webLastUpdatedBy: req.user._id,
       apiLastUpdatedBy: req.user._id,
       webLastUpdatedAt: new Date(),
@@ -330,6 +679,153 @@ router.post('/pricing', [
   });
 }));
 
+// @route   PUT /api/admin/pricing/:id
+// @desc    Update existing pricing
+// @access  Admin  
+router.put('/pricing/:id', [
+  body('prices.adminCost').optional().isNumeric(),
+  body('prices.dealer').optional().isNumeric(),
+  body('prices.superAgent').optional().isNumeric(),
+  body('prices.agent').optional().isNumeric(),
+  body('prices.user').optional().isNumeric(),
+  body('description').optional().isString(),
+  body('isPopular').optional().isBoolean(),
+  validate
+], asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const { prices, description, isPopular, tags } = req.body;
+
+  const pricing = await DataPricing.findById(id);
+  if (!pricing) {
+    return res.status(404).json({
+      success: false,
+      message: 'Pricing not found'
+    });
+  }
+
+  // Validate price hierarchy if prices are being updated
+  if (prices) {
+    const finalPrices = { ...pricing.prices, ...prices };
+    
+    if (finalPrices.adminCost >= finalPrices.dealer || 
+        finalPrices.dealer >= finalPrices.superAgent || 
+        finalPrices.superAgent >= finalPrices.agent || 
+        finalPrices.agent >= finalPrices.user) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid price hierarchy. Prices must increase with each role level.'
+      });
+    }
+    
+    pricing.prices = finalPrices;
+  }
+
+  if (description !== undefined) pricing.description = description;
+  if (isPopular !== undefined) pricing.isPopular = isPopular;
+  if (tags !== undefined) pricing.tags = tags;
+  
+  pricing.lastUpdatedBy = req.user._id;
+  pricing.updatedAt = new Date();
+
+  await pricing.save();
+
+  res.status(200).json({
+    success: true,
+    message: 'Pricing updated successfully',
+    data: pricing
+  });
+}));
+
+// @route   DELETE /api/admin/pricing/:id
+// @desc    Delete pricing item
+// @access  Admin
+router.delete('/pricing/:id', asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const pricing = await DataPricing.findById(id);
+  if (!pricing) {
+    return res.status(404).json({
+      success: false,
+      message: 'Pricing not found'
+    });
+  }
+
+  // Soft delete by setting isActive to false
+  pricing.isActive = false;
+  pricing.deletedBy = req.user._id;
+  pricing.deletedAt = new Date();
+  await pricing.save();
+
+  res.status(200).json({
+    success: true,
+    message: 'Pricing deleted successfully'
+  });
+}));
+
+// @route   POST /api/admin/pricing/bulk
+// @desc    Bulk import pricing data
+// @access  Admin
+router.post('/pricing/bulk', [
+  body('pricingData').isArray(),
+  body('pricingData.*.network').isIn(['YELLO', 'MTN', 'TELECEL', 'AT_PREMIUM', 'AIRTELTIGO', 'AT']),
+  body('pricingData.*.capacity').isNumeric(),
+  body('pricingData.*.prices.adminCost').isNumeric(),
+  body('pricingData.*.prices.dealer').isNumeric(),
+  body('pricingData.*.prices.superAgent').isNumeric(),
+  body('pricingData.*.prices.agent').isNumeric(),
+  body('pricingData.*.prices.user').isNumeric(),
+  validate
+], asyncHandler(async (req, res) => {
+  const { pricingData } = req.body;
+  
+  const results = [];
+  const errors = [];
+
+  for (const item of pricingData) {
+    try {
+      // Check if pricing already exists
+      let pricing = await DataPricing.findOne({
+        network: item.network,
+        capacity: item.capacity
+      });
+
+      if (pricing) {
+        // Update existing
+        pricing.prices = item.prices;
+        pricing.description = item.description || pricing.description;
+        pricing.isPopular = item.isPopular !== undefined ? item.isPopular : pricing.isPopular;
+        pricing.tags = item.tags || pricing.tags;
+        pricing.lastUpdatedBy = req.user._id;
+      } else {
+        // Create new
+        pricing = new DataPricing({
+          ...item,
+          lastUpdatedBy: req.user._id
+        });
+      }
+
+      await pricing.save();
+      results.push({
+        network: item.network,
+        capacity: item.capacity,
+        status: 'success'
+      });
+    } catch (error) {
+      errors.push({
+        network: item.network,
+        capacity: item.capacity,
+        error: error.message
+      });
+    }
+  }
+
+  res.status(200).json({
+    success: true,
+    message: `Bulk import completed. Success: ${results.length}, Failed: ${errors.length}`,
+    results,
+    errors
+  });
+}));
 
 // @route   PUT /api/admin/pricing/:pricingId/stock
 // @desc    Update stock status for specific capacity
@@ -365,6 +861,66 @@ router.put('/pricing/:pricingId/stock', [
     message: 'Stock status updated',
     data: pricing
   });
+}));
+
+// @route   POST /api/admin/pricing/promo
+// @desc    Set promotional pricing
+// @access  Admin
+router.post('/pricing/promo', [
+  body('network').isIn(['YELLO', 'MTN', 'TELECEL', 'AT_PREMIUM', 'AIRTELTIGO', 'AT']),
+  body('capacity').isNumeric(),
+  body('promoPrice').isNumeric(),
+  body('promoStartDate').isISO8601(),
+  body('promoEndDate').isISO8601(),
+  validate
+], asyncHandler(async (req, res) => {
+  const { network, capacity, promoPrice, promoStartDate, promoEndDate } = req.body;
+
+  const pricing = await DataPricing.findOne({ network, capacity });
+  if (!pricing) {
+    return res.status(404).json({
+      success: false,
+      message: 'Pricing not found'
+    });
+  }
+
+  pricing.promoPrice = promoPrice;
+  pricing.promoStartDate = new Date(promoStartDate);
+  pricing.promoEndDate = new Date(promoEndDate);
+  pricing.lastUpdatedBy = req.user._id;
+
+  await pricing.save();
+
+  res.status(200).json({
+    success: true,
+    message: 'Promotional pricing set',
+    data: pricing
+  });
+}));
+
+// @route   GET /api/admin/inventory
+// @desc    Get all network inventory status
+// @access  Admin
+router.get('/inventory', asyncHandler(async (req, res) => {
+  try {
+    const inventory = await DataInventory.find({})
+      .populate('webLastUpdatedBy', 'name')
+      .populate('apiLastUpdatedBy', 'name')
+      .sort({ network: 1 });
+
+    res.status(200).json({
+      success: true,
+      data: inventory,
+      count: inventory.length
+    });
+  } catch (error) {
+    console.error('Error fetching inventory:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch inventory data',
+      error: error.message
+    });
+  }
 }));
 
 // @route   PUT /api/admin/inventory/:network
@@ -408,41 +964,6 @@ router.put('/inventory/:network', [
     success: true,
     message: 'Inventory updated',
     data: inventory
-  });
-}));
-
-// @route   POST /api/admin/pricing/promo
-// @desc    Set promotional pricing
-// @access  Admin
-router.post('/pricing/promo', [
-  body('network').isIn(['YELLO', 'MTN', 'TELECEL', 'AT_PREMIUM', 'AIRTELTIGO', 'AT']),
-  body('capacity').isNumeric(),
-  body('promoPrice').isNumeric(),
-  body('promoStartDate').isISO8601(),
-  body('promoEndDate').isISO8601(),
-  validate
-], asyncHandler(async (req, res) => {
-  const { network, capacity, promoPrice, promoStartDate, promoEndDate } = req.body;
-
-  const pricing = await DataPricing.findOne({ network, capacity });
-  if (!pricing) {
-    return res.status(404).json({
-      success: false,
-      message: 'Pricing not found'
-    });
-  }
-
-  pricing.promoPrice = promoPrice;
-  pricing.promoStartDate = new Date(promoStartDate);
-  pricing.promoEndDate = new Date(promoEndDate);
-  pricing.lastUpdatedBy = req.user._id;
-
-  await pricing.save();
-
-  res.status(200).json({
-    success: true,
-    message: 'Promotional pricing set',
-    data: pricing
   });
 }));
 
@@ -651,6 +1172,7 @@ router.get('/transactions', asyncHandler(async (req, res) => {
 }));
 
 // ==================== PURCHASE MANAGEMENT ====================
+// ⚠️ IMPORTANT: Order matters! Static routes MUST come before dynamic routes
 
 // @route   GET /api/admin/purchases
 // @desc    Get all purchases with filters
@@ -704,60 +1226,106 @@ router.get('/purchases', asyncHandler(async (req, res) => {
   });
 }));
 
-// @route   PUT /api/admin/purchases/:purchaseId
-// @desc    Update purchase status
+// @route   PUT /api/admin/purchases/bulk-status
+// @desc    Bulk update purchase status
 // @access  Admin
-router.put('/purchases/:purchaseId', [  
+// ⚠️ THIS ROUTE MUST COME BEFORE /purchases/:purchaseId
+router.put('/purchases/bulk-status', [
+  body('purchaseIds').isArray().notEmpty(),
   body('status').isIn(['pending', 'completed', 'failed', 'processing', 'refunded', 'delivered']),
   body('adminNotes').optional().isString(),
   validate
 ], asyncHandler(async (req, res) => {
-  const { purchaseId } = req.params;
-  const { status, adminNotes } = req.body;
+  const { purchaseIds, status, adminNotes } = req.body;
+  
+  const results = {
+    successful: [],
+    failed: [],
+    refunded: []
+  };
 
-  const purchase = await DataPurchase.findById(purchaseId);
-  if (!purchase) {
-    return res.status(404).json({
-      success: false,
-      message: 'Purchase not found'
-    });
-  }
+  for (const purchaseId of purchaseIds) {
+    try {
+      const purchase = await DataPurchase.findById(purchaseId);
+      
+      if (!purchase) {
+        results.failed.push({
+          purchaseId,
+          reason: 'Purchase not found'
+        });
+        continue;
+      }
 
-  const oldStatus = purchase.status;
-  purchase.status = status;
-  if (adminNotes) purchase.adminNotes = adminNotes;
-  purchase.updatedBy = req.user._id;
-  purchase.updatedAt = new Date();
+      const oldStatus = purchase.status;
+      purchase.status = status;
+      if (adminNotes) {
+        purchase.adminNotes = (purchase.adminNotes || '') + '\n' + adminNotes;
+      }
+      purchase.updatedBy = req.user._id;
+      purchase.updatedAt = new Date();
 
-  await purchase.save();
+      await purchase.save();
 
-  // Handle refund if status changed to refunded
-  if (status === 'refunded' && oldStatus !== 'refunded') {
-    const user = await User.findById(purchase.userId);
-    const refundAmount = purchase.price;
-    
-    user.walletBalance += refundAmount;
-    await user.save();
+      // Handle refund if status changed to refunded
+      if (status === 'refunded' && oldStatus !== 'refunded') {
+        const user = await User.findById(purchase.userId);
+        if (user) {
+          const refundAmount = purchase.price;
+          
+          user.walletBalance += refundAmount;
+          await user.save();
 
-    // Create refund transaction
-    await Transaction.create({
-      userId: purchase.userId,
-      type: 'refund',
-      amount: refundAmount,
-      balanceBefore: user.walletBalance - refundAmount,
-      balanceAfter: user.walletBalance,
-      status: 'completed',
-      reference: `REFUND-${purchase.reference}`,
-      gateway: 'wallet-refund',
-      relatedPurchaseId: purchase._id,
-      description: `Refund for purchase ${purchase.reference}`
-    });
+          // Create refund transaction
+          await Transaction.create({
+            userId: purchase.userId,
+            type: 'refund',
+            amount: refundAmount,
+            balanceBefore: user.walletBalance - refundAmount,
+            balanceAfter: user.walletBalance,
+            status: 'completed',
+            reference: `REFUND-${purchase.reference}`,
+            gateway: 'wallet-refund',
+            relatedPurchaseId: purchase._id,
+            description: `Refund for purchase ${purchase.reference}`
+          });
+
+          results.refunded.push({
+            purchaseId: purchase._id,
+            reference: purchase.reference,
+            amount: refundAmount,
+            userId: purchase.userId
+          });
+
+          // Send notification to user
+          await Notification.create({
+            userId: purchase.userId,
+            title: 'Purchase Refunded',
+            message: `Your purchase ${purchase.reference} has been refunded. GHS ${refundAmount} has been credited to your wallet.`,
+            type: 'success',
+            category: 'transaction'
+          });
+        }
+      }
+
+      results.successful.push({
+        purchaseId: purchase._id,
+        reference: purchase.reference,
+        oldStatus,
+        newStatus: status
+      });
+
+    } catch (error) {
+      results.failed.push({
+        purchaseId,
+        reason: error.message
+      });
+    }
   }
 
   res.status(200).json({
     success: true,
-    message: 'Purchase updated successfully',
-    data: purchase
+    message: `Bulk update completed. ${results.successful.length} successful, ${results.failed.length} failed, ${results.refunded.length} refunded`,
+    data: results
   });
 }));
 
@@ -815,6 +1383,64 @@ router.post('/purchases/manual', [
   res.status(200).json({
     success: true,
     message: 'Manual purchase created',
+    data: purchase
+  });
+}));
+
+// @route   PUT /api/admin/purchases/:purchaseId
+// @desc    Update purchase status (single purchase)
+// @access  Admin
+// ⚠️ THIS ROUTE MUST COME AFTER bulk-status AND manual
+router.put('/purchases/:purchaseId', [  
+  body('status').isIn(['pending', 'completed', 'failed', 'processing', 'refunded', 'delivered']),
+  body('adminNotes').optional().isString(),
+  validate
+], asyncHandler(async (req, res) => {
+  const { purchaseId } = req.params;
+  const { status, adminNotes } = req.body;
+
+  const purchase = await DataPurchase.findById(purchaseId);
+  if (!purchase) {
+    return res.status(404).json({
+      success: false,
+      message: 'Purchase not found'
+    });
+  }
+
+  const oldStatus = purchase.status;
+  purchase.status = status;
+  if (adminNotes) purchase.adminNotes = adminNotes;
+  purchase.updatedBy = req.user._id;
+  purchase.updatedAt = new Date();
+
+  await purchase.save();
+
+  // Handle refund if status changed to refunded
+  if (status === 'refunded' && oldStatus !== 'refunded') {
+    const user = await User.findById(purchase.userId);
+    const refundAmount = purchase.price;
+    
+    user.walletBalance += refundAmount;
+    await user.save();
+
+    // Create refund transaction
+    await Transaction.create({
+      userId: purchase.userId,
+      type: 'refund',
+      amount: refundAmount,
+      balanceBefore: user.walletBalance - refundAmount,
+      balanceAfter: user.walletBalance,
+      status: 'completed',
+      reference: `REFUND-${purchase.reference}`,
+      gateway: 'wallet-refund',
+      relatedPurchaseId: purchase._id,
+      description: `Refund for purchase ${purchase.reference}`
+    });
+  }
+
+  res.status(200).json({
+    success: true,
+    message: 'Purchase updated successfully',
     data: purchase
   });
 }));
@@ -1342,6 +1968,121 @@ router.get('/analytics/agents', asyncHandler(async (req, res) => {
   });
 }));
 
+// @route   GET /api/admin/activities/recent
+// @desc    Get recent admin activities
+// @access  Admin
+router.get('/activities/recent', asyncHandler(async (req, res) => {
+  const { 
+    limit = 20,
+    types = ['all'],
+    startDate,
+    endDate 
+  } = req.query;
+
+  const activities = [];
+  const dateFilter = {};
+  
+  if (startDate) dateFilter.$gte = new Date(startDate);
+  if (endDate) dateFilter.$lte = new Date(endDate);
+  
+  const shouldInclude = (type) => types.includes('all') || types.includes(type);
+
+  try {
+    // Fetch different types of activities in parallel
+    const promises = [];
+
+    // 1. Recent User Registrations
+    if (shouldInclude('registration')) {
+      promises.push(
+        User.find({ 
+          createdAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+        })
+        .select('name email role createdAt approvalStatus')
+        .sort({ createdAt: -1 })
+        .limit(Math.min(limit, 10))
+        .lean()
+        .then(users => users.map(user => ({
+          type: 'User Registration',
+          message: `New ${user.role} registered: ${user.name}`,
+          time: user.createdAt,
+          status: user.approvalStatus === 'approved' ? 'success' : 'pending',
+          category: 'user',
+          metadata: {
+            userId: user._id,
+            userEmail: user.email,
+            userRole: user.role
+          }
+        })))
+      );
+    }
+
+    // 2. Recent Purchases
+    if (shouldInclude('purchase')) {
+      promises.push(
+        DataPurchase.find({
+          createdAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
+        })
+        .populate('userId', 'name')
+        .select('network capacity phoneNumber status createdAt price userId')
+        .sort({ createdAt: -1 })
+        .limit(Math.min(limit, 10))
+        .lean()
+        .then(purchases => purchases.map(purchase => ({
+          type: 'Purchase',
+          message: `${purchase.network} ${purchase.capacity}GB purchase ${purchase.status === 'completed' ? 'completed' : purchase.status}`,
+          time: purchase.createdAt,
+          status: purchase.status === 'completed' ? 'success' : 
+                  purchase.status === 'failed' ? 'failed' : 'pending',
+          category: 'transaction',
+          metadata: {
+            purchaseId: purchase._id,
+            network: purchase.network,
+            capacity: purchase.capacity,
+            amount: purchase.price,
+            phoneNumber: purchase.phoneNumber,
+            userName: purchase.userId?.name || 'Unknown'
+          }
+        })))
+      );
+    }
+
+    // Execute all promises in parallel
+    const results = await Promise.all(promises);
+    
+    // Flatten and combine all activities
+    results.forEach(result => activities.push(...result));
+
+    // Sort all activities by time (most recent first)
+    activities.sort((a, b) => new Date(b.time) - new Date(a.time));
+
+    // Limit to requested number
+    const limitedActivities = activities.slice(0, parseInt(limit));
+
+    // Format time as relative time
+    const formattedActivities = limitedActivities.map(activity => ({
+      ...activity,
+      timeAgo: getRelativeTime(activity.time),
+      timestamp: activity.time
+    }));
+
+    res.status(200).json({
+      success: true,
+      data: {
+        activities: formattedActivities,
+        timestamp: new Date()
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching recent activities:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching recent activities',
+      error: error.message
+    });
+  }
+}));
+
 // ==================== API KEY MANAGEMENT ====================
 
 // @route   GET /api/admin/api-keys
@@ -1472,334 +2213,6 @@ router.get('/system/health', asyncHandler(async (req, res) => {
   });
 }));
 
-router.get('/activities/recent', asyncHandler(async (req, res) => {
-  const { 
-    limit = 20,
-    types = ['all'],
-    startDate,
-    endDate 
-  } = req.query;
-
-  const activities = [];
-  const dateFilter = {};
-  
-  if (startDate) dateFilter.$gte = new Date(startDate);
-  if (endDate) dateFilter.$lte = new Date(endDate);
-  
-  const shouldInclude = (type) => types.includes('all') || types.includes(type);
-
-  try {
-    // Fetch different types of activities in parallel
-    const promises = [];
-
-    // 1. Recent User Registrations
-    if (shouldInclude('registration')) {
-      promises.push(
-        User.find({ 
-          createdAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
-        })
-        .select('name email role createdAt approvalStatus')
-        .sort({ createdAt: -1 })
-        .limit(Math.min(limit, 10))
-        .lean()
-        .then(users => users.map(user => ({
-          type: 'User Registration',
-          message: `New ${user.role} registered: ${user.name}`,
-          time: user.createdAt,
-          status: user.approvalStatus === 'approved' ? 'success' : 'pending',
-          category: 'user',
-          metadata: {
-            userId: user._id,
-            userEmail: user.email,
-            userRole: user.role
-          }
-        })))
-      );
-    }
-
-    // 2. Recent Purchases
-    if (shouldInclude('purchase')) {
-      promises.push(
-        DataPurchase.find({
-          createdAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
-        })
-        .populate('userId', 'name')
-        .select('network capacity phoneNumber status createdAt price userId')
-        .sort({ createdAt: -1 })
-        .limit(Math.min(limit, 10))
-        .lean()
-        .then(purchases => purchases.map(purchase => ({
-          type: 'Purchase',
-          message: `${purchase.network} ${purchase.capacity}GB purchase ${purchase.status === 'completed' ? 'completed' : purchase.status}`,
-          time: purchase.createdAt,
-          status: purchase.status === 'completed' ? 'success' : 
-                  purchase.status === 'failed' ? 'failed' : 'pending',
-          category: 'transaction',
-          metadata: {
-            purchaseId: purchase._id,
-            network: purchase.network,
-            capacity: purchase.capacity,
-            amount: purchase.price,
-            phoneNumber: purchase.phoneNumber,
-            userName: purchase.userId?.name || 'Unknown'
-          }
-        })))
-      );
-    }
-
-    // 3. Recent Transactions (Deposits & Withdrawals)
-    if (shouldInclude('transaction')) {
-      promises.push(
-        Transaction.find({
-          createdAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-          type: { $in: ['deposit', 'withdrawal', 'wallet_funding', 'admin_credit', 'admin_debit'] }
-        })
-        .populate('userId', 'name')
-        .select('type amount status createdAt userId gateway')
-        .sort({ createdAt: -1 })
-        .limit(Math.min(limit, 10))
-        .lean()
-        .then(transactions => transactions.map(transaction => {
-          let message = '';
-          if (transaction.type === 'withdrawal') {
-            message = `${transaction.status === 'pending' ? 'Pending' : 'Completed'} withdrawal request GHS ${transaction.amount.toFixed(2)}`;
-          } else if (transaction.type === 'deposit' || transaction.type === 'wallet_funding') {
-            message = `Wallet funding GHS ${transaction.amount.toFixed(2)} via ${transaction.gateway}`;
-          } else if (transaction.type === 'admin_credit') {
-            message = `Admin credit GHS ${transaction.amount.toFixed(2)} to ${transaction.userId?.name || 'User'}`;
-          } else if (transaction.type === 'admin_debit') {
-            message = `Admin debit GHS ${transaction.amount.toFixed(2)} from ${transaction.userId?.name || 'User'}`;
-          }
-          
-          return {
-            type: transaction.type === 'withdrawal' ? 'Withdrawal' : 
-                  transaction.type === 'admin_credit' || transaction.type === 'admin_debit' ? 'Admin Action' : 'Deposit',
-            message,
-            time: transaction.createdAt,
-            status: transaction.status === 'completed' ? 'success' : 
-                    transaction.status === 'failed' ? 'failed' : 'pending',
-            category: 'financial',
-            metadata: {
-              transactionId: transaction._id,
-              amount: transaction.amount,
-              gateway: transaction.gateway,
-              userName: transaction.userId?.name || 'Unknown'
-            }
-          };
-        }))
-      );
-    }
-
-    // 4. Store Verifications
-    if (shouldInclude('store')) {
-      promises.push(
-        AgentStore.find({
-          $or: [
-            { createdAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
-            { verifiedAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } }
-          ]
-        })
-        .populate('agent', 'name')
-        .select('storeName verificationStatus createdAt verifiedAt agent')
-        .sort({ createdAt: -1 })
-        .limit(Math.min(limit, 10))
-        .lean()
-        .then(stores => stores.map(store => ({
-          type: 'Store Verification',
-          message: store.verificationStatus === 'pending' ? 
-                   `New store pending verification: ${store.storeName}` :
-                   `Store ${store.storeName} ${store.verificationStatus}`,
-          time: store.verifiedAt || store.createdAt,
-          status: store.verificationStatus === 'verified' ? 'success' : 
-                  store.verificationStatus === 'rejected' ? 'failed' : 'pending',
-          category: 'store',
-          metadata: {
-            storeId: store._id,
-            storeName: store.storeName,
-            agentName: store.agent?.name || 'Unknown'
-          }
-        })))
-      );
-    }
-
-    // 5. Failed Transactions/Purchases
-    if (shouldInclude('failed')) {
-      promises.push(
-        Transaction.find({
-          createdAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) },
-          status: 'failed'
-        })
-        .populate('userId', 'name')
-        .select('type amount createdAt userId reference')
-        .sort({ createdAt: -1 })
-        .limit(Math.min(limit, 5))
-        .lean()
-        .then(failed => failed.map(transaction => ({
-          type: 'Transaction',
-          message: `Failed ${transaction.type} attempt - GHS ${transaction.amount.toFixed(2)}`,
-          time: transaction.createdAt,
-          status: 'failed',
-          category: 'error',
-          metadata: {
-            transactionId: transaction._id,
-            reference: transaction.reference,
-            userName: transaction.userId?.name || 'Unknown'
-          }
-        })))
-      );
-    }
-
-    // 6. API Key Activities
-    if (shouldInclude('api')) {
-      promises.push(
-        ApiKey.find({
-          createdAt: dateFilter.$gte || dateFilter.$lte ? dateFilter : { $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) }
-        })
-        .populate('userId', 'name')
-        .select('name isActive createdAt userId')
-        .sort({ createdAt: -1 })
-        .limit(Math.min(limit, 5))
-        .lean()
-        .then(keys => keys.map(key => ({
-          type: 'API Key',
-          message: `New API key created: ${key.name}`,
-          time: key.createdAt,
-          status: key.isActive ? 'success' : 'pending',
-          category: 'system',
-          metadata: {
-            keyId: key._id,
-            keyName: key.name,
-            userName: key.userId?.name || 'Unknown'
-          }
-        })))
-      );
-    }
-
-    // Execute all promises in parallel
-    const results = await Promise.all(promises);
-    
-    // Flatten and combine all activities
-    results.forEach(result => activities.push(...result));
-
-    // Sort all activities by time (most recent first)
-    activities.sort((a, b) => new Date(b.time) - new Date(a.time));
-
-    // Limit to requested number
-    const limitedActivities = activities.slice(0, parseInt(limit));
-
-    // Format time as relative time (e.g., "2 min ago", "5 hours ago")
-    const formattedActivities = limitedActivities.map(activity => ({
-      ...activity,
-      timeAgo: getRelativeTime(activity.time),
-      timestamp: activity.time
-    }));
-
-    // Get activity statistics
-    const stats = {
-      total: formattedActivities.length,
-      byStatus: {
-        success: formattedActivities.filter(a => a.status === 'success').length,
-        pending: formattedActivities.filter(a => a.status === 'pending').length,
-        failed: formattedActivities.filter(a => a.status === 'failed').length
-      },
-      byCategory: {
-        user: formattedActivities.filter(a => a.category === 'user').length,
-        transaction: formattedActivities.filter(a => a.category === 'transaction').length,
-        financial: formattedActivities.filter(a => a.category === 'financial').length,
-        store: formattedActivities.filter(a => a.category === 'store').length,
-        system: formattedActivities.filter(a => a.category === 'system').length,
-        error: formattedActivities.filter(a => a.category === 'error').length
-      }
-    };
-
-    res.status(200).json({
-      success: true,
-      data: {
-        activities: formattedActivities,
-        stats,
-        timestamp: new Date()
-      }
-    });
-
-  } catch (error) {
-    console.error('Error fetching recent activities:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Error fetching recent activities',
-      error: error.message
-    });
-  }
-}));
-
-// @route   GET /api/admin/activities/stream
-// @desc    Get activity stream with pagination
-// @access  Admin
-router.get('/activities/stream', asyncHandler(async (req, res) => {
-  const { 
-    page = 1,
-    limit = 50,
-    category,
-    status,
-    userId,
-    startDate,
-    endDate
-  } = req.query;
-
-  // This would be better implemented with a dedicated Activity collection
-  // For now, we'll aggregate from multiple collections
-  
-  const skip = (page - 1) * limit;
-  const activities = [];
-
-  // Build filters
-  const dateFilter = {};
-  if (startDate || endDate) {
-    dateFilter.createdAt = {};
-    if (startDate) dateFilter.createdAt.$gte = new Date(startDate);
-    if (endDate) dateFilter.createdAt.$lte = new Date(endDate);
-  }
-
-  // Fetch from different collections based on category
-  if (!category || category === 'all' || category === 'transaction') {
-    const purchases = await DataPurchase.find(dateFilter)
-      .populate('userId', 'name email')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean();
-
-    purchases.forEach(p => {
-      activities.push({
-        id: p._id,
-        type: 'purchase',
-        category: 'transaction',
-        message: `${p.network} ${p.capacity}GB purchase`,
-        status: p.status,
-        user: p.userId,
-        amount: p.price,
-        timestamp: p.createdAt
-      });
-    });
-  }
-
-  // Sort and paginate
-  activities.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-  const paginatedActivities = activities.slice(0, parseInt(limit));
-
-  res.status(200).json({
-    success: true,
-    data: {
-      activities: paginatedActivities,
-      pagination: {
-        total: activities.length,
-        page: parseInt(page),
-        pages: Math.ceil(activities.length / limit),
-        limit: parseInt(limit)
-      }
-    }
-  });
-}));
-
 // Helper function to get relative time
 function getRelativeTime(date) {
   const now = new Date();
@@ -1815,650 +2228,6 @@ function getRelativeTime(date) {
   if (days < 7) return `${days} day${days > 1 ? 's' : ''} ago`;
   
   return new Date(date).toLocaleDateString();
-
-
 }
-
-
-// Add these endpoints to your admin routes file (routes/admin.js)
-// Place them in the PRICING & INVENTORY MANAGEMENT section
-
-// @route   GET /api/admin/pricing
-// @desc    Get all pricing data with filters
-// @access  Admin
-router.get('/pricing', asyncHandler(async (req, res) => {
-  const { 
-    network, 
-    capacity, 
-    inStockOnly, 
-    isActive = 'true',
-    sortBy = 'network',
-    order = 'asc' 
-  } = req.query;
-
-  // Build filter
-  const filter = {};
-  
-  if (network) filter.network = network;
-  if (capacity) filter.capacity = parseFloat(capacity);
-  if (isActive !== undefined) filter.isActive = isActive === 'true';
-  
-  if (inStockOnly === 'true') {
-    filter['stock.overallInStock'] = true;
-  }
-
-  try {
-    // Fetch pricing data
-    const pricingData = await DataPricing.find(filter)
-      .populate('lastUpdatedBy', 'name email')
-      .sort({ [sortBy]: order === 'desc' ? -1 : 1 });
-
-    // Get statistics
-    const stats = {
-      total: pricingData.length,
-      inStock: pricingData.filter(p => p.stock?.overallInStock).length,
-      outOfStock: pricingData.filter(p => !p.stock?.overallInStock).length,
-      webInStock: pricingData.filter(p => p.stock?.webInStock).length,
-      apiInStock: pricingData.filter(p => p.stock?.apiInStock).length,
-      popular: pricingData.filter(p => p.isPopular).length
-    };
-
-    // Calculate average margins
-    const margins = pricingData.map(p => {
-      const adminCost = p.prices.adminCost;
-      const userPrice = p.prices.user;
-      return ((userPrice - adminCost) / adminCost) * 100;
-    });
-    
-    stats.avgMargin = margins.length > 0 
-      ? (margins.reduce((a, b) => a + b, 0) / margins.length).toFixed(2)
-      : 0;
-
-    res.status(200).json({
-      success: true,
-      data: pricingData,
-      stats,
-      count: pricingData.length
-    });
-  } catch (error) {
-    console.error('Error fetching pricing:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch pricing data',
-      error: error.message
-    });
-  }
-}));
-
-// @route   GET /api/admin/pricing/:id
-// @desc    Get single pricing item
-// @access  Admin
-router.get('/pricing/:id', asyncHandler(async (req, res) => {
-  const { id } = req.params;
-
-  const pricing = await DataPricing.findById(id)
-    .populate('lastUpdatedBy', 'name email');
-
-  if (!pricing) {
-    return res.status(404).json({
-      success: false,
-      message: 'Pricing not found'
-    });
-  }
-
-  res.status(200).json({
-    success: true,
-    data: pricing
-  });
-}));
-
-// @route   PUT /api/admin/pricing/:id
-// @desc    Update existing pricing
-// @access  Admin  
-router.put('/pricing/:id', [
-  body('prices.adminCost').optional().isNumeric(),
-  body('prices.dealer').optional().isNumeric(),
-  body('prices.superAgent').optional().isNumeric(),
-  body('prices.agent').optional().isNumeric(),
-  body('prices.user').optional().isNumeric(),
-  body('description').optional().isString(),
-  body('isPopular').optional().isBoolean(),
-  validate
-], asyncHandler(async (req, res) => {
-  const { id } = req.params;
-  const { prices, description, isPopular, tags } = req.body;
-
-  const pricing = await DataPricing.findById(id);
-  if (!pricing) {
-    return res.status(404).json({
-      success: false,
-      message: 'Pricing not found'
-    });
-  }
-
-  // Validate price hierarchy if prices are being updated
-  if (prices) {
-    const finalPrices = { ...pricing.prices, ...prices };
-    
-    if (finalPrices.adminCost >= finalPrices.dealer || 
-        finalPrices.dealer >= finalPrices.superAgent || 
-        finalPrices.superAgent >= finalPrices.agent || 
-        finalPrices.agent >= finalPrices.user) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid price hierarchy. Prices must increase with each role level.'
-      });
-    }
-    
-    pricing.prices = finalPrices;
-  }
-
-  if (description !== undefined) pricing.description = description;
-  if (isPopular !== undefined) pricing.isPopular = isPopular;
-  if (tags !== undefined) pricing.tags = tags;
-  
-  pricing.lastUpdatedBy = req.user._id;
-  pricing.updatedAt = new Date();
-
-  await pricing.save();
-
-  res.status(200).json({
-    success: true,
-    message: 'Pricing updated successfully',
-    data: pricing
-  });
-}));
-
-// @route   DELETE /api/admin/pricing/:id
-// @desc    Delete pricing item
-// @access  Admin
-router.delete('/pricing/:id', asyncHandler(async (req, res) => {
-  const { id } = req.params;
-
-  const pricing = await DataPricing.findById(id);
-  if (!pricing) {
-    return res.status(404).json({
-      success: false,
-      message: 'Pricing not found'
-    });
-  }
-
-  // Soft delete by setting isActive to false
-  pricing.isActive = false;
-  pricing.deletedBy = req.user._id;
-  pricing.deletedAt = new Date();
-  await pricing.save();
-
-  // Or hard delete
-  // await pricing.remove();
-
-  res.status(200).json({
-    success: true,
-    message: 'Pricing deleted successfully'
-  });
-}));
-
-// @route   GET /api/admin/inventory
-// @desc    Get all network inventory status
-// @access  Admin
-router.get('/inventory', asyncHandler(async (req, res) => {
-  try {
-    const inventory = await DataInventory.find({})
-      .populate('webLastUpdatedBy', 'name')
-      .populate('apiLastUpdatedBy', 'name')
-      .sort({ network: 1 });
-
-    res.status(200).json({
-      success: true,
-      data: inventory,
-      count: inventory.length
-    });
-  } catch (error) {
-    console.error('Error fetching inventory:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to fetch inventory data',
-      error: error.message
-    });
-  }
-}));
-
-// @route   POST /api/admin/pricing/bulk
-// @desc    Bulk import pricing data
-// @access  Admin
-router.post('/pricing/bulk', [
-  body('pricingData').isArray(),
-  body('pricingData.*.network').isIn(['YELLO', 'MTN', 'TELECEL', 'AT_PREMIUM', 'AIRTELTIGO', 'AT']),
-  body('pricingData.*.capacity').isNumeric(),
-  body('pricingData.*.prices.adminCost').isNumeric(),
-  body('pricingData.*.prices.dealer').isNumeric(),
-  body('pricingData.*.prices.superAgent').isNumeric(),
-  body('pricingData.*.prices.agent').isNumeric(),
-  body('pricingData.*.prices.user').isNumeric(),
-  validate
-], asyncHandler(async (req, res) => {
-  const { pricingData } = req.body;
-  
-  const results = [];
-  const errors = [];
-
-  for (const item of pricingData) {
-    try {
-      // Check if pricing already exists
-      let pricing = await DataPricing.findOne({
-        network: item.network,
-        capacity: item.capacity
-      });
-
-      if (pricing) {
-        // Update existing
-        pricing.prices = item.prices;
-        pricing.description = item.description || pricing.description;
-        pricing.isPopular = item.isPopular !== undefined ? item.isPopular : pricing.isPopular;
-        pricing.tags = item.tags || pricing.tags;
-        pricing.lastUpdatedBy = req.user._id;
-      } else {
-        // Create new
-        pricing = new DataPricing({
-          ...item,
-          lastUpdatedBy: req.user._id
-        });
-      }
-
-      await pricing.save();
-      results.push({
-        network: item.network,
-        capacity: item.capacity,
-        status: 'success'
-      });
-    } catch (error) {
-      errors.push({
-        network: item.network,
-        capacity: item.capacity,
-        error: error.message
-      });
-    }
-  }
-
-  res.status(200).json({
-    success: true,
-    message: `Bulk import completed. Success: ${results.length}, Failed: ${errors.length}`,
-    results,
-    errors
-  });
-}));
-// Update in your backend routes/admin.js - Fix the ObjectId usage
-
-// @route   GET /api/admin/users/:userId/purchases
-// @desc    Get all purchases for a specific user (today only or all time)
-// @access  Admin
-router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
-  const { userId } = req.params;
-  const { 
-    todayOnly = 'false',
-    network,
-    status,
-    startDate,
-    endDate,
-    page = 1,
-    limit = 50,
-    sortBy = 'createdAt',
-    order = 'desc'
-  } = req.query;
-
-  // Import mongoose at the top of your file if not already done
-  const mongoose = require('mongoose');
-
-  // Verify user exists
-  const user = await User.findById(userId);
-  if (!user) {
-    return res.status(404).json({
-      success: false,
-      message: 'User not found'
-    });
-  }
-
-  // Build filter - Use 'new' when creating ObjectId
-  const filter = { userId: new mongoose.Types.ObjectId(userId) };
-  
-  // Add date filter based on todayOnly flag
-  if (todayOnly === 'true') {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    
-    filter.createdAt = {
-      $gte: today,
-      $lt: tomorrow
-    };
-  } else if (startDate || endDate) {
-    // Custom date range
-    filter.createdAt = {};
-    if (startDate) filter.createdAt.$gte = new Date(startDate);
-    if (endDate) filter.createdAt.$lte = new Date(endDate);
-  }
-
-  // Add other filters
-  if (network) filter.network = network;
-  if (status) filter.status = status;
-
-  // Fetch purchases
-  const purchases = await DataPurchase.find(filter)
-    .populate('agentId', 'name email')
-    .sort({ [sortBy]: order === 'desc' ? -1 : 1 })
-    .limit(limit * 1)
-    .skip((page - 1) * limit);
-
-  const total = await DataPurchase.countDocuments(filter);
-
-  // Calculate statistics - Fix the aggregation with 'new' ObjectId
-  const stats = await DataPurchase.aggregate([
-    { $match: { userId: new mongoose.Types.ObjectId(userId) } }, // Use 'new' here
-    {
-      $group: {
-        _id: null,
-        totalAmount: { $sum: '$price' },
-        totalPurchases: { $sum: 1 },
-        avgPurchaseValue: { $avg: '$price' },
-        totalCapacity: { $sum: '$capacity' }
-      }
-    }
-  ]);
-
-  // Get breakdown by network - for all purchases
-  const networkBreakdown = await DataPurchase.aggregate([
-    { $match: { userId: new mongoose.Types.ObjectId(userId) } }, // Use 'new' here
-    {
-      $group: {
-        _id: '$network',
-        count: { $sum: 1 },
-        totalAmount: { $sum: '$price' },
-        totalCapacity: { $sum: '$capacity' }
-      }
-    },
-    { $sort: { totalAmount: -1 } }
-  ]);
-
-  // Get breakdown by status - for all purchases
-  const statusBreakdown = await DataPurchase.aggregate([
-    { $match: { userId: new mongoose.Types.ObjectId(userId) } }, // Use 'new' here
-    {
-      $group: {
-        _id: '$status',
-        count: { $sum: 1 },
-        totalAmount: { $sum: '$price' }
-      }
-    }
-  ]);
-
-  // Get today's stats if not filtering by today only
-  let todayStats = null;
-  if (todayOnly !== 'true') {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const tomorrow = new Date(today);
-    tomorrow.setDate(tomorrow.getDate() + 1);
-    
-    todayStats = await DataPurchase.aggregate([
-      {
-        $match: {
-          userId: new mongoose.Types.ObjectId(userId), // Use 'new' here
-          createdAt: { $gte: today, $lt: tomorrow }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          todayTotal: { $sum: '$price' },
-          todayCount: { $sum: 1 }
-        }
-      }
-    ]);
-  }
-
-  // Debug logging
-  console.log('User purchases stats:', {
-    userId,
-    totalPurchases: total,
-    statsResult: stats,
-    networkBreakdown,
-    statusBreakdown
-  });
-
-  res.status(200).json({
-    success: true,
-    data: {
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        phoneNumber: user.phoneNumber,
-        role: user.role,
-        walletBalance: user.walletBalance
-      },
-      purchases,
-      statistics: {
-        overall: stats[0] || {
-          totalAmount: 0,
-          totalPurchases: 0,
-          avgPurchaseValue: 0,
-          totalCapacity: 0
-        },
-        today: todayOnly === 'true' ? null : (todayStats?.[0] || {
-          todayTotal: 0,
-          todayCount: 0
-        }),
-        byNetwork: networkBreakdown || [],
-        byStatus: statusBreakdown || []
-      },
-      pagination: {
-        total,
-        page: parseInt(page),
-        pages: Math.ceil(total / limit),
-        limit: parseInt(limit)
-      },
-      filters: {
-        todayOnly: todayOnly === 'true',
-        network,
-        status,
-        dateRange: startDate || endDate ? { startDate, endDate } : null
-      }
-    }
-  });
-}));
-
-// Add this route in the PURCHASE MANAGEMENT section of your admin.js file
-
-// @route   PUT /api/admin/purchases/bulk-status
-// @desc    Bulk update purchase status
-// @access  Admin
-router.put('/purchases/bulk-status', [
-  body('purchaseIds').isArray().notEmpty(),
-  body('status').isIn(['pending', 'completed', 'failed', 'processing', 'refunded', 'delivered']),
-  body('adminNotes').optional().isString(),
-  validate
-], asyncHandler(async (req, res) => {
-  const { purchaseIds, status, adminNotes } = req.body;
-  
-  const results = {
-    successful: [],
-    failed: [],
-    refunded: []
-  };
-
-  for (const purchaseId of purchaseIds) {
-    try {
-      const purchase = await DataPurchase.findById(purchaseId);
-      
-      if (!purchase) {
-        results.failed.push({
-          purchaseId,
-          reason: 'Purchase not found'
-        });
-        continue;
-      }
-
-      const oldStatus = purchase.status;
-      purchase.status = status;
-      if (adminNotes) {
-        purchase.adminNotes = (purchase.adminNotes || '') + '\n' + adminNotes;
-      }
-      purchase.updatedBy = req.user._id;
-      purchase.updatedAt = new Date();
-
-      await purchase.save();
-
-      // Handle refund if status changed to refunded
-      if (status === 'refunded' && oldStatus !== 'refunded') {
-        const user = await User.findById(purchase.userId);
-        if (user) {
-          const refundAmount = purchase.price;
-          
-          user.walletBalance += refundAmount;
-          await user.save();
-
-          // Create refund transaction
-          await Transaction.create({
-            userId: purchase.userId,
-            type: 'refund',
-            amount: refundAmount,
-            balanceBefore: user.walletBalance - refundAmount,
-            balanceAfter: user.walletBalance,
-            status: 'completed',
-            reference: `REFUND-${purchase.reference}`,
-            gateway: 'wallet-refund',
-            relatedPurchaseId: purchase._id,
-            description: `Refund for purchase ${purchase.reference}`
-          });
-
-          results.refunded.push({
-            purchaseId: purchase._id,
-            reference: purchase.reference,
-            amount: refundAmount,
-            userId: purchase.userId
-          });
-
-          // Send notification to user
-          await Notification.create({
-            userId: purchase.userId,
-            title: 'Purchase Refunded',
-            message: `Your purchase ${purchase.reference} has been refunded. GHS ${refundAmount} has been credited to your wallet.`,
-            type: 'success',
-            category: 'transaction'
-          });
-        }
-      }
-
-      results.successful.push({
-        purchaseId: purchase._id,
-        reference: purchase.reference,
-        oldStatus,
-        newStatus: status
-      });
-
-    } catch (error) {
-      results.failed.push({
-        purchaseId,
-        reason: error.message
-      });
-    }
-  }
-
-  res.status(200).json({
-    success: true,
-    message: `Bulk update completed. ${results.successful.length} successful, ${results.failed.length} failed, ${results.refunded.length} refunded`,
-    data: results
-  });
-}));
-
-router.put('/users/:userId/api-access', [
-  body('enabled').isBoolean(),
-  body('tier').optional().isIn(['basic', 'premium', 'enterprise']),
-  body('rateLimit').optional().isNumeric().isInt({ min: 1, max: 10000 }),
-  validate
-], asyncHandler(async (req, res) => {
-  const { userId } = req.params;
-  const { enabled, tier = 'basic', rateLimit = 100 } = req.body;
-
-  const user = await User.findById(userId);
-  if (!user) {
-    return res.status(404).json({
-      success: false,
-      message: 'User not found'
-    });
-  }
-
-  // Update API access settings
-  user.apiAccess = {
-    enabled,
-    tier: enabled ? tier : user.apiAccess?.tier || 'basic',
-    rateLimit: enabled ? rateLimit : user.apiAccess?.rateLimit || 100
-  };
-
-  await user.save();
-
-  // If enabling API access, check if user has an API key
-  let apiKey = null;
-  if (enabled) {
-    apiKey = await ApiKey.findOne({ userId: user._id, isActive: true });
-    
-    // Create a new API key if none exists
-    if (!apiKey) {
-      const crypto = require('crypto');
-      const keyString = `sk_${crypto.randomBytes(32).toString('hex')}`;
-      
-      apiKey = new ApiKey({
-        userId: user._id,
-        key: keyString,
-        name: `Default API Key for ${user.name}`,
-        description: 'Auto-generated API key',
-        permissions: tier === 'enterprise' 
-          ? ['read:all', 'write:all'] 
-          : tier === 'premium'
-          ? ['read:products', 'write:purchases', 'read:transactions', 'read:balance']
-          : ['read:products', 'write:purchases'],
-        rateLimit: {
-          requests: rateLimit,
-          period: '1m'
-        },
-        isActive: true
-      });
-      
-      await apiKey.save();
-    }
-  } else {
-    // Disable all API keys when disabling API access
-    await ApiKey.updateMany(
-      { userId: user._id },
-      { isActive: false }
-    );
-  }
-
-  // Send notification to user
-  await Notification.create({
-    userId: user._id,
-    title: enabled ? 'API Access Enabled' : 'API Access Disabled',
-    message: enabled 
-      ? `Your API access has been enabled with ${tier} tier (${rateLimit} requests/minute)`
-      : 'Your API access has been disabled',
-    type: 'info',
-    category: 'account'
-  });
-
-  res.status(200).json({
-    success: true,
-    message: `API access ${enabled ? 'enabled' : 'disabled'} successfully`,
-    data: {
-      userId: user._id,
-      apiAccess: user.apiAccess,
-      apiKey: enabled && apiKey ? {
-        id: apiKey._id,
-        key: apiKey.key.substring(0, 10) + '...',
-        name: apiKey.name
-      } : null
-    }
-  });
-}));
 
 module.exports = router;
