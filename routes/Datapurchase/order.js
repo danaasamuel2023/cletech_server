@@ -1,13 +1,15 @@
-// ==================== routes/purchase.js ====================
-// Complete Purchase Routes File with Bulk Purchase Features
-const { adminOnly, asyncHandler, validate } = require('../../middleware/middleware');
+// ==================== routes/purchase.js - COMPLETE UPDATED FILE ====================
+// Complete Purchase Routes with Webhook Handler, Auto-Delete, and All Features
 
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
+const crypto = require('crypto'); // ADDED for webhook signature
+const cron = require('node-cron'); // ADDED for scheduled cleanup
 const multer = require('multer');
 const XLSX = require('xlsx');
+const { adminOnly, asyncHandler, validate } = require('../../middleware/middleware');
 
 const { 
   DataPurchase, 
@@ -18,6 +20,8 @@ const {
   AgentStore, 
   AgentProfit 
 } = require('../../Schema/Schema');
+const SystemSettings = require('../../settingsSchema/schema');
+
 
 // ==================== MIDDLEWARE ====================
 const jwt = require('jsonwebtoken');
@@ -71,7 +75,6 @@ const optionalAuth = async (req, res, next) => {
     
     next();
   } catch (error) {
-    // Continue without user
     next();
   }
 };
@@ -96,6 +99,47 @@ const upload = multer({
   }
 });
 
+// ==================== PAYSTACK CONFIGURATION ====================
+
+// Get Paystack configuration from SystemSettings
+const getPaystackConfig = async () => {
+  const settings = await SystemSettings.getSettings();
+  
+  if (!settings.paymentGateway?.paystack?.enabled) {
+    throw new Error('Paystack payment gateway is disabled');
+  }
+  
+  const secretKey = settings.paymentGateway.paystack.secretKey || process.env.PAYSTACK_SECRET_KEY;
+  const publicKey = settings.paymentGateway.paystack.publicKey || process.env.PAYSTACK_PUBLIC_KEY;
+  
+  if (!secretKey || !publicKey) {
+    throw new Error('Paystack keys not configured');
+  }
+  
+  return {
+    secretKey,
+    publicKey,
+    webhookUrl: settings.paymentGateway.paystack.webhookUrl,
+    transactionFee: settings.paymentGateway.paystack.transactionFee || 1.95,
+    capAt: settings.paymentGateway.paystack.capAt || 100,
+    splitPayment: settings.paymentGateway.paystack.splitPayment || false,
+    subaccountCode: settings.paymentGateway.paystack.subaccountCode
+  };
+};
+
+// Create Paystack API instance with dynamic config
+const getPaystackAPI = async () => {
+  const config = await getPaystackConfig();
+  
+  return axios.create({
+    baseURL: 'https://api.paystack.co',
+    headers: {
+      Authorization: `Bearer ${config.secretKey}`,
+      'Content-Type': 'application/json'
+    }
+  });
+};
+
 // ==================== VALIDATION ====================
 const validatePurchase = [
   body('phoneNumber')
@@ -109,6 +153,7 @@ const validatePurchase = [
     .isFloat({ min: 0.1, max: 100 })
     .withMessage('Capacity must be between 0.1 and 100 GB'),
   body('gateway')
+    .optional()
     .isIn(['paystack', 'wallet'])
     .withMessage('Invalid payment method')
 ];
@@ -152,7 +197,6 @@ const getUserPrice = (pricing, userRole) => {
 // Check stock availability
 const checkStockAvailability = async (network, capacity, method = 'web') => {
   try {
-    // Check network-level inventory
     const inventory = await DataInventory.findOne({ network });
     if (!inventory || !inventory.inStock) {
       return { 
@@ -161,7 +205,6 @@ const checkStockAvailability = async (network, capacity, method = 'web') => {
       };
     }
 
-    // Check method-specific stock
     if (method === 'web' && !inventory.webInStock) {
       return { 
         available: false, 
@@ -176,7 +219,6 @@ const checkStockAvailability = async (network, capacity, method = 'web') => {
       };
     }
 
-    // Check specific product pricing and stock
     const pricing = await DataPricing.findOne({
       network,
       capacity,
@@ -230,11 +272,9 @@ const processWalletPayment = async (userId, amount, reference, purchase) => {
       throw new Error('Insufficient wallet balance');
     }
 
-    // Deduct from wallet
     user.walletBalance -= amount;
     await user.save();
 
-    // Create transaction record
     await Transaction.create({
       userId,
       type: 'purchase',
@@ -248,7 +288,6 @@ const processWalletPayment = async (userId, amount, reference, purchase) => {
       description: `Data purchase: ${purchase.capacity}GB ${purchase.network}`
     });
 
-    // Update purchase status to processing (not completed)
     purchase.status = 'processing';
     await purchase.save();
 
@@ -258,6 +297,110 @@ const processWalletPayment = async (userId, amount, reference, purchase) => {
   }
 };
 
+// NEW: Update store statistics (used by webhook)
+const updateStoreStatistics = async (purchase) => {
+  try {
+    if (purchase.method === 'agent_store' && purchase.agentId) {
+      console.log(`[WEBHOOK] Updating store stats for agent: ${purchase.agentId}`);
+      
+      // 1. Update Agent User Profit Balance
+      const agent = await User.findById(purchase.agentId);
+      if (agent) {
+        const profitAmount = purchase.pricing.agentProfit || 0;
+        agent.agentProfit = (agent.agentProfit || 0) + profitAmount;
+        agent.totalEarnings = (agent.totalEarnings || 0) + profitAmount;
+        await agent.save();
+        console.log(`[WEBHOOK] Updated agent profit: +${profitAmount} GHS`);
+      }
+
+      // 2. Update Agent Profit Record
+      await AgentProfit.findOneAndUpdate(
+        { purchaseId: purchase._id },
+        { 
+          status: 'credited',
+          creditedAt: new Date()
+        }
+      );
+
+      // 3. Update Store Statistics - COMPREHENSIVE UPDATE
+      const storeUpdate = await AgentStore.findOneAndUpdate(
+        { agent: purchase.agentId },
+        {
+          $inc: {
+            'statistics.totalSales': 1,
+            'statistics.totalOrders': 1,
+            'statistics.totalRevenue': purchase.price,
+            'statistics.totalProfit': purchase.pricing.agentProfit || 0,
+            'statistics.totalCustomers': 1,
+            'statistics.todayProfit': purchase.pricing.agentProfit || 0,
+            'statistics.weekProfit': purchase.pricing.agentProfit || 0,
+            'statistics.monthProfit': purchase.pricing.agentProfit || 0
+          },
+          $set: {
+            'statistics.lastSaleDate': new Date()
+          }
+        },
+        { new: true }
+      );
+      
+      console.log(`[WEBHOOK] Store stats updated for: ${storeUpdate?.storeName}`);
+      return true;
+    }
+    return false;
+  } catch (error) {
+    console.error('[WEBHOOK] Error updating store stats:', error);
+    return false;
+  }
+};
+
+// NEW: Auto-delete abandoned orders
+const deleteAbandonedOrders = async () => {
+  try {
+    const cutoffTime = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes ago
+    
+    console.log(`[CLEANUP] Running cleanup at ${new Date().toISOString()}`);
+    
+    const abandonedOrders = await DataPurchase.find({
+      status: 'pending',
+      createdAt: { $lt: cutoffTime }
+    }).select('_id reference agentId');
+
+    if (abandonedOrders.length === 0) {
+      return 0;
+    }
+
+    console.log(`[CLEANUP] Found ${abandonedOrders.length} abandoned orders to delete`);
+
+    const orderIds = abandonedOrders.map(order => order._id);
+
+    const deletedProfits = await AgentProfit.deleteMany({
+      purchaseId: { $in: orderIds },
+      status: 'pending'
+    });
+    console.log(`[CLEANUP] Deleted ${deletedProfits.deletedCount} pending profit records`);
+
+    const deletedOrders = await DataPurchase.deleteMany({
+      _id: { $in: orderIds }
+    });
+    console.log(`[CLEANUP] Deleted ${deletedOrders.deletedCount} abandoned orders`);
+
+    return deletedOrders.deletedCount;
+  } catch (error) {
+    console.error('[CLEANUP ERROR]', error);
+    return 0;
+  }
+};
+
+// NEW: Schedule cleanup to run every 2 minutes
+cron.schedule('*/2 * * * *', async () => {
+  await deleteAbandonedOrders();
+});
+
+// NEW: Run initial cleanup on startup
+deleteAbandonedOrders().then(count => {
+  console.log(`[STARTUP] Initial cleanup completed. Deleted ${count} abandoned orders.`);
+});
+
 // ==================== MAIN PURCHASE ROUTES ====================
 
 // 1. Purchase data (authenticated users)
@@ -266,7 +409,10 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
     const { phoneNumber, network, capacity, gateway } = req.body;
     const userId = req.user._id;
 
-    // Check stock availability
+    // Get system settings
+    const settings = await SystemSettings.getSettings();
+    const paystackConfig = await getPaystackConfig();
+
     const stockCheck = await checkStockAvailability(network, capacity, 'web');
     if (!stockCheck.available) {
       return res.status(400).json({
@@ -275,10 +421,8 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
       });
     }
 
-    // Get user's price based on role
     const userPrice = getUserPrice(stockCheck.pricing, req.user.role);
 
-    // Validate wallet balance if wallet payment
     if (gateway === 'wallet') {
       if (req.user.walletBalance < userPrice) {
         return res.status(400).json({
@@ -290,10 +434,8 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
       }
     }
 
-    // Generate reference
     const reference = generateReference('PURCHASE');
 
-    // Create purchase record
     const purchase = await DataPurchase.create({
       userId,
       phoneNumber,
@@ -311,9 +453,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
       status: gateway === 'wallet' ? 'processing' : 'pending'
     });
 
-    // Process based on payment method
     if (gateway === 'wallet') {
-      // Process wallet payment immediately
       const walletResult = await processWalletPayment(userId, userPrice, reference, purchase);
       
       res.json({
@@ -325,37 +465,36 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
           network,
           capacity,
           phoneNumber,
-          status: 'processing',  // Changed from 'completed' to 'processing'
+          status: 'processing',
           newBalance: walletResult.newBalance
         }
       });
     } else {
-      // Initialize Paystack payment
-      const paystackResponse = await axios.post(
-        'https://api.paystack.co/transaction/initialize',
-        {
-          email: req.user.email,
-          amount: userPrice * 100, // Convert to pesewas
-          reference,
-          metadata: {
-            purchaseId: purchase._id,
-            userId,
-            network,
-            capacity,
-            phoneNumber
-          },
-          callback_url: `${process.env.FRONTEND_URL}/purchase/verify/${reference}`
+      // Use the Paystack API instance with dynamic config
+      const paystackAPI = await getPaystackAPI();
+      const paystackResponse = await paystackAPI.post('/transaction/initialize', {
+        email: req.user.email,
+        amount: userPrice * 100,
+        reference,
+        currency: settings.platform?.currency || 'GHS',
+        metadata: {
+          purchaseId: purchase._id,
+          userId,
+          network,
+          capacity,
+          phoneNumber
         },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
-          }
-        }
-      );
+        callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/store${reference}`,
+        ...(paystackConfig.subaccountCode && {
+          subaccount: paystackConfig.subaccountCode,
+          bearer: 'account'
+        })
+      });
 
       res.json({
         success: true,
         message: 'Payment initialized',
+        requiresPayment: true,
         data: {
           reference: purchase.reference,
           amount: userPrice,
@@ -364,7 +503,8 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
           phoneNumber,
           status: purchase.status,
           paymentUrl: paystackResponse.data.data.authorization_url,
-          accessCode: paystackResponse.data.data.access_code
+          accessCode: paystackResponse.data.data.access_code,
+          publicKey: paystackConfig.publicKey
         }
       });
     }
@@ -379,13 +519,24 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
   }
 });
 
-// 2. Purchase through agent store (can be guest)
+// 2. Purchase through agent store (UPDATED WITH FIXES)
 router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation, async (req, res) => {
   try {
     const { subdomain } = req.params;
-    const { phoneNumber, network, capacity, gateway, customerEmail, customerName } = req.body;
+    const { phoneNumber, network, capacity, customerEmail, customerName } = req.body;
 
-    // Find and validate agent store
+    console.log('Store purchase request:', { 
+      subdomain, 
+      network, 
+      capacity, 
+      phoneNumber,
+      timestamp: new Date().toISOString() 
+    });
+
+    // Get system settings
+    const settings = await SystemSettings.getSettings();
+    const paystackConfig = await getPaystackConfig();
+
     const store = await AgentStore.findOne({ 
       subdomain: subdomain.toLowerCase(),
       isActive: true
@@ -398,7 +549,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       });
     }
 
-    // Check if store is open
     if (!store.operatingStatus.isOpen) {
       return res.status(400).json({
         success: false,
@@ -408,7 +558,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       });
     }
 
-    // Check stock availability
     const stockCheck = await checkStockAvailability(network, capacity, 'web');
     if (!stockCheck.available) {
       return res.status(400).json({
@@ -417,7 +566,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       });
     }
 
-    // Find agent's custom pricing for this product
     const customPricing = store.customPricing.find(
       p => p.network === network && 
            p.capacity === capacity && 
@@ -431,22 +579,27 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       });
     }
 
-    // Calculate pricing
     const systemPrice = customPricing.systemPrice;
     const agentPrice = customPricing.agentPrice;
     const agentProfit = agentPrice - systemPrice;
 
-    // Generate reference
+    console.log('Pricing calculated:', {
+      systemPrice,
+      agentPrice,
+      agentProfit,
+      profitMargin: ((agentProfit / systemPrice) * 100).toFixed(2) + '%'
+    });
+
     const reference = generateReference('STORE');
 
-    // Create purchase record
+    // CRITICAL: Create purchase with PENDING status
     const purchase = await DataPurchase.create({
       userId: req.user?._id || null,
       agentId: store.agent._id,
       phoneNumber,
       network,
       capacity,
-      gateway,
+      gateway: 'paystack',
       method: 'agent_store',
       price: agentPrice,
       pricing: {
@@ -456,7 +609,7 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         agentProfit
       },
       reference,
-      status: 'pending',
+      status: 'pending', // ALWAYS PENDING
       storeInfo: {
         storeId: store._id,
         storeName: store.storeName,
@@ -464,11 +617,17 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       },
       customerInfo: {
         name: customerName || 'Guest',
-        email: customerEmail || 'guest@customer.com'
+        email: customerEmail || req.user?.email || `guest_${Date.now()}@customer.com`,
+        phoneNumber: phoneNumber
       }
     });
 
-    // Create pending agent profit record
+    console.log('Purchase record created:', {
+      id: purchase._id,
+      reference: purchase.reference,
+      status: purchase.status
+    });
+
     const agentProfitRecord = await AgentProfit.create({
       agentId: store.agent._id,
       purchaseId: purchase._id,
@@ -482,38 +641,62 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       status: 'pending'
     });
 
-    // Update store statistics
-    store.statistics.totalOrders += 1;
-    await store.save();
+    console.log('Agent profit record created (pending):', {
+      id: agentProfitRecord._id,
+      profit: agentProfit,
+      status: 'pending'
+    });
 
-    // Initialize Paystack payment
-    const paystackResponse = await axios.post(
-      'https://api.paystack.co/transaction/initialize',
-      {
-        email: customerEmail || req.user?.email || `guest_${Date.now()}@customer.com`,
-        amount: agentPrice * 100, // Convert to pesewas
-        reference,
-        metadata: {
-          purchaseId: purchase._id,
-          agentId: store.agent._id,
-          agentProfitId: agentProfitRecord._id,
-          network,
-          capacity,
-          phoneNumber,
-          storeName: store.storeName
-        },
-        callback_url: `${process.env.FRONTEND_URL}/store/${subdomain}/verify/${reference}`
+    // Initialize Paystack payment - ALWAYS REQUIRED
+    console.log('Initializing Paystack payment...');
+    
+    const paystackPayload = {
+      email: customerEmail || req.user?.email || `guest_${Date.now()}@customer.com`,
+      amount: Math.round(agentPrice * 100),
+      reference,
+      currency: settings.platform?.currency || 'GHS',
+      metadata: {
+        purchaseId: purchase._id.toString(),
+        agentId: store.agent._id.toString(),
+        agentProfitId: agentProfitRecord._id.toString(),
+        network,
+        capacity,
+        phoneNumber,
+        storeName: store.storeName,
+        storeId: store._id.toString(),
+        isStorePurchase: true,
+        customerName: customerName || 'Guest'
       },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
-        }
-      }
-    );
+      callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/store/${subdomain}/verify?reference=${reference}`,
+      channels: ['card', 'bank', 'mobile_money'],
+      ...(paystackConfig.subaccountCode && {
+        subaccount: paystackConfig.subaccountCode,
+        bearer: 'account'
+      })
+    };
+
+    // Use the Paystack API instance with dynamic config
+    const paystackAPI = await getPaystackAPI();
+    const paystackResponse = await paystackAPI.post('/transaction/initialize', paystackPayload);
+
+    if (!paystackResponse.data.status || !paystackResponse.data.data.authorization_url) {
+      await DataPurchase.findByIdAndDelete(purchase._id);
+      await AgentProfit.findByIdAndDelete(agentProfitRecord._id);
+      
+      console.error('Paystack initialization failed:', paystackResponse.data);
+      
+      return res.status(500).json({
+        success: false,
+        message: 'Payment initialization failed. Please try again.'
+      });
+    }
+
+    console.log('Paystack payment initialized successfully');
 
     res.json({
       success: true,
-      message: 'Payment initialized',
+      message: 'Payment initialization successful',
+      requiresPayment: true, // CRITICAL FLAG
       data: {
         reference: purchase.reference,
         amount: agentPrice,
@@ -521,28 +704,220 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         capacity,
         phoneNumber,
         storeName: store.storeName,
-        status: purchase.status,
+        status: 'pending',
         paymentUrl: paystackResponse.data.data.authorization_url,
-        accessCode: paystackResponse.data.data.access_code
+        accessCode: paystackResponse.data.data.access_code,
+        publicKey: paystackConfig.publicKey,
+        paymentInfo: {
+          currency: settings.platform?.currency || 'GHS',
+          email: paystackPayload.email,
+          channels: paystackPayload.channels
+        }
       }
     });
 
   } catch (error) {
     console.error('Store purchase error:', error);
+    
+    let errorMessage = 'Purchase failed. Please try again.';
+    
+    if (error.response?.data?.message) {
+      errorMessage = error.response.data.message;
+    } else if (error.message.includes('PAYSTACK')) {
+      errorMessage = 'Payment service temporarily unavailable. Please try again later.';
+    }
+
     res.status(500).json({
       success: false,
-      message: 'Purchase failed',
+      message: errorMessage,
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// 3. Verify payment (Paystack callback)
+// 3. NEW: PAYSTACK WEBHOOK HANDLER
+router.post('/webhook/paystack', async (req, res) => {
+  try {
+    console.log('[WEBHOOK] Received Paystack webhook');
+    
+    // Get Paystack config for webhook verification
+    const paystackConfig = await getPaystackConfig();
+    
+    // Verify webhook signature
+    const hash = crypto
+      .createHmac('sha512', paystackConfig.secretKey)
+      .update(JSON.stringify(req.body))
+      .digest('hex');
+    
+    if (hash !== req.headers['x-paystack-signature']) {
+      console.error('[WEBHOOK] Invalid signature');
+      return res.status(401).send('Unauthorized');
+    }
+
+    const event = req.body;
+    console.log(`[WEBHOOK] Event type: ${event.event}`);
+    console.log(`[WEBHOOK] Reference: ${event.data?.reference}`);
+
+    switch (event.event) {
+      // SUCCESSFUL PAYMENT
+      case 'charge.success':
+        const successData = event.data;
+        const successReference = successData.reference;
+        
+        console.log(`[WEBHOOK] Processing successful payment: ${successReference}`);
+        
+        const purchase = await DataPurchase.findOne({ reference: successReference });
+        
+        if (!purchase) {
+          console.error(`[WEBHOOK] Purchase not found: ${successReference}`);
+          return res.status(404).send('Purchase not found');
+        }
+
+        if (purchase.status === 'processing' || purchase.status === 'completed') {
+          console.log(`[WEBHOOK] Purchase already processed: ${successReference}`);
+          return res.status(200).send('Already processed');
+        }
+
+        // Update purchase to PROCESSING
+        purchase.status = 'processing';
+        purchase.paystackReference = successData.reference;
+        purchase.verifiedAt = new Date();
+        purchase.paymentDetails = {
+          amount: successData.amount / 100,
+          currency: successData.currency,
+          channel: successData.channel,
+          paidAt: successData.paid_at,
+          fees: successData.fees ? successData.fees / 100 : 0,
+          customerEmail: successData.customer.email
+        };
+        await purchase.save();
+
+        console.log(`[WEBHOOK] Purchase updated to processing: ${successReference}`);
+
+        // Update store statistics if it's a store purchase
+        if (purchase.method === 'agent_store') {
+          await updateStoreStatistics(purchase);
+        }
+
+        // Create transaction record
+        await Transaction.create({
+          userId: purchase.userId || purchase.agentId,
+          type: 'purchase',
+          amount: purchase.price,
+          reference: successReference,
+          gateway: 'paystack',
+          status: 'completed',
+          relatedPurchaseId: purchase._id,
+          description: `Data purchase: ${purchase.capacity}GB ${purchase.network}`,
+          webhookData: {
+            eventType: event.event,
+            paystackReference: successData.reference,
+            processedAt: new Date()
+          }
+        });
+
+        console.log(`[WEBHOOK] Transaction created for: ${successReference}`);
+        res.status(200).send('OK');
+        break;
+
+      // FAILED PAYMENT
+      case 'charge.failed':
+        const failedData = event.data;
+        const failedReference = failedData.reference;
+        
+        console.log(`[WEBHOOK] Processing failed payment: ${failedReference}`);
+        
+        await DataPurchase.findOneAndUpdate(
+          { reference: failedReference },
+          { 
+            status: 'failed',
+            failedAt: new Date(),
+            failureReason: failedData.gateway_response || 'Payment failed'
+          }
+        );
+
+        const failedPurchase = await DataPurchase.findOne({ reference: failedReference });
+        if (failedPurchase) {
+          await AgentProfit.findOneAndUpdate(
+            { purchaseId: failedPurchase._id },
+            { 
+              status: 'cancelled',
+              cancelledAt: new Date()
+            }
+          );
+        }
+
+        console.log(`[WEBHOOK] Purchase marked as failed: ${failedReference}`);
+        res.status(200).send('OK');
+        break;
+
+      // REFUND
+      case 'refund.processed':
+        const refundData = event.data;
+        const refundReference = refundData.transaction_reference;
+        
+        console.log(`[WEBHOOK] Processing refund: ${refundReference}`);
+        
+        const refundPurchase = await DataPurchase.findOne({ reference: refundReference });
+        
+        if (refundPurchase) {
+          refundPurchase.status = 'refunded';
+          refundPurchase.refundedAt = new Date();
+          refundPurchase.refundAmount = refundData.amount / 100;
+          await refundPurchase.save();
+
+          if (refundPurchase.method === 'agent_store' && refundPurchase.agentId) {
+            const agent = await User.findById(refundPurchase.agentId);
+            if (agent) {
+              const profitToReverse = refundPurchase.pricing.agentProfit || 0;
+              agent.agentProfit = Math.max(0, (agent.agentProfit || 0) - profitToReverse);
+              agent.totalEarnings = Math.max(0, (agent.totalEarnings || 0) - profitToReverse);
+              await agent.save();
+            }
+
+            await AgentProfit.findOneAndUpdate(
+              { purchaseId: refundPurchase._id },
+              { 
+                status: 'refunded',
+                refundedAt: new Date()
+              }
+            );
+
+            await AgentStore.findOneAndUpdate(
+              { agent: refundPurchase.agentId },
+              {
+                $inc: {
+                  'statistics.totalSales': -1,
+                  'statistics.totalOrders': -1,
+                  'statistics.totalRevenue': -refundPurchase.price,
+                  'statistics.totalProfit': -(refundPurchase.pricing.agentProfit || 0)
+                }
+              }
+            );
+          }
+
+          console.log(`[WEBHOOK] Refund processed for: ${refundReference}`);
+        }
+        
+        res.status(200).send('OK');
+        break;
+
+      default:
+        console.log(`[WEBHOOK] Unhandled event: ${event.event}`);
+        res.status(200).send('OK');
+    }
+
+  } catch (error) {
+    console.error('[WEBHOOK ERROR]', error);
+    res.status(500).send('Webhook processing failed');
+  }
+});
+
+// 4. Verify payment (kept for backward compatibility)
 router.get('/verify/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
 
-    // Find purchase or check for batch reference
     let purchases = await DataPurchase.find({ batchReference: reference });
     
     if (!purchases || purchases.length === 0) {
@@ -556,7 +931,6 @@ router.get('/verify/:reference', async (req, res) => {
       purchases = [singlePurchase];
     }
 
-    // If already processing or completed, return success
     if (purchases.every(p => p.status === 'processing' || p.status === 'completed')) {
       return res.json({
         success: true,
@@ -569,59 +943,23 @@ router.get('/verify/:reference', async (req, res) => {
       });
     }
 
-    // Verify with Paystack
-    const verifyResponse = await axios.get(
-      `https://api.paystack.co/transaction/verify/${reference}`,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
-        }
-      }
-    );
+    // Use the Paystack API instance with dynamic config
+    const paystackAPI = await getPaystackAPI();
+    const verifyResponse = await paystackAPI.get(`/transaction/verify/${reference}`);
 
     const paymentData = verifyResponse.data.data;
 
     if (paymentData.status === 'success') {
-      // Update all purchases status to processing (not completed)
       for (const purchase of purchases) {
-        purchase.status = 'processing';  // Changed from 'completed' to 'processing'
+        purchase.status = 'processing';
         purchase.paystackReference = paymentData.reference;
         await purchase.save();
 
-        // Handle agent profit if it's a store purchase
-        if (purchase.method === 'agent_store' && purchase.agentId) {
-          // Credit agent profit
-          const agent = await User.findById(purchase.agentId);
-          agent.agentProfit += purchase.pricing.agentProfit;
-          agent.totalEarnings += purchase.pricing.agentProfit;
-          await agent.save();
-
-          // Update agent profit record
-          await AgentProfit.findOneAndUpdate(
-            { purchaseId: purchase._id },
-            { 
-              status: 'credited',
-              creditedAt: new Date()
-            }
-          );
-
-          // Update store statistics
-          await AgentStore.findOneAndUpdate(
-            { agent: purchase.agentId },
-            {
-              $inc: {
-                'statistics.totalSales': 1,
-                'statistics.totalRevenue': purchase.price,
-                'statistics.totalProfit': purchase.pricing.agentProfit,
-                'statistics.totalCustomers': 1
-              },
-              'statistics.lastSaleDate': new Date()
-            }
-          );
+        if (purchase.method === 'agent_store') {
+          await updateStoreStatistics(purchase);
         }
       }
 
-      // Create transaction record
       const totalAmount = purchases.reduce((sum, p) => sum + p.price, 0);
       await Transaction.create({
         userId: purchases[0].userId || purchases[0].agentId,
@@ -641,7 +979,7 @@ router.get('/verify/:reference', async (req, res) => {
         message: 'Payment verified successfully',
         data: {
           reference,
-          status: 'processing',  // Changed from 'completed' to 'processing'
+          status: 'processing',
           amount: totalAmount,
           totalItems: purchases.length,
           purchases: purchases.map(p => ({
@@ -653,7 +991,6 @@ router.get('/verify/:reference', async (req, res) => {
         }
       });
     } else {
-      // Payment failed
       for (const purchase of purchases) {
         purchase.status = 'failed';
         await purchase.save();
@@ -676,15 +1013,17 @@ router.get('/verify/:reference', async (req, res) => {
   }
 });
 
-// 4. Get purchase history
+// 5. Get purchase history (excluding pending)
 router.get('/history', protect, async (req, res) => {
   try {
     const { page = 1, limit = 20, status, network, from, to } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    // Build filter
-    const filter = { userId: req.user._id };
-    if (status) filter.status = status;
+    const filter = { 
+      userId: req.user._id,
+      status: { $ne: 'pending' } // Exclude pending orders
+    };
+    if (status && status !== 'pending') filter.status = status;
     if (network) filter.network = network;
     
     if (from || to) {
@@ -693,7 +1032,6 @@ router.get('/history', protect, async (req, res) => {
       if (to) filter.createdAt.$lte = new Date(to);
     }
 
-    // Get purchases
     const purchases = await DataPurchase.find(filter)
       .sort({ createdAt: -1 })
       .limit(parseInt(limit))
@@ -703,7 +1041,6 @@ router.get('/history', protect, async (req, res) => {
 
     const total = await DataPurchase.countDocuments(filter);
 
-    // Calculate summary
     const summary = await DataPurchase.aggregate([
       { $match: filter },
       {
@@ -746,7 +1083,7 @@ router.get('/history', protect, async (req, res) => {
   }
 });
 
-// 5. Get single purchase details
+// 6. Get single purchase details
 router.get('/details/:reference', protect, async (req, res) => {
   try {
     const { reference } = req.params;
@@ -784,24 +1121,21 @@ router.get('/details/:reference', protect, async (req, res) => {
   }
 });
 
-// 6. Get available products with pricing
+// 7. Get available products with pricing
 router.get('/products', optionalAuth, async (req, res) => {
   try {
     const { network, inStockOnly = 'true' } = req.query;
 
-    // Build filter
     const filter = { isActive: true };
     if (network) filter.network = network;
     if (inStockOnly === 'true') {
       filter['stock.overallInStock'] = true;
     }
 
-    // Get products
     const products = await DataPricing.find(filter)
       .select('network capacity prices stock description tags isPopular promoPrice')
       .sort({ network: 1, capacity: 1 });
 
-    // Format products with user's price
     const userRole = req.user?.role || 'user';
     
     const formattedProducts = products.map(product => {
@@ -825,7 +1159,6 @@ router.get('/products', optionalAuth, async (req, res) => {
       };
     });
 
-    // Group by network
     const groupedProducts = formattedProducts.reduce((acc, product) => {
       if (!acc[product.network]) {
         acc[product.network] = [];
@@ -854,7 +1187,7 @@ router.get('/products', optionalAuth, async (req, res) => {
   }
 });
 
-// 7. Cancel pending purchase
+// 8. Cancel pending purchase
 router.post('/cancel/:reference', protect, async (req, res) => {
   try {
     const { reference } = req.params;
@@ -872,7 +1205,6 @@ router.post('/cancel/:reference', protect, async (req, res) => {
       });
     }
 
-    // Update status
     purchase.status = 'cancelled';
     await purchase.save();
 
@@ -895,7 +1227,7 @@ router.post('/cancel/:reference', protect, async (req, res) => {
   }
 });
 
-// 8. Retry failed purchase
+// 9. Retry failed purchase
 router.post('/retry/:reference', protect, async (req, res) => {
   try {
     const { reference } = req.params;
@@ -913,10 +1245,12 @@ router.post('/retry/:reference', protect, async (req, res) => {
       });
     }
 
-    // Generate new reference
+    // Get system settings and Paystack config
+    const settings = await SystemSettings.getSettings();
+    const paystackConfig = await getPaystackConfig();
+
     const newReference = generateReference('RETRY');
     
-    // Create new purchase with same details
     const newPurchase = await DataPurchase.create({
       ...purchase.toObject(),
       _id: undefined,
@@ -925,25 +1259,23 @@ router.post('/retry/:reference', protect, async (req, res) => {
       createdAt: new Date()
     });
 
-    // Initialize new payment
-    const paystackResponse = await axios.post(
-      'https://api.paystack.co/transaction/initialize',
-      {
-        email: req.user.email,
-        amount: purchase.price * 100,
-        reference: newReference,
-        metadata: {
-          purchaseId: newPurchase._id,
-          retry: true,
-          originalReference: reference
-        }
+    // Use the Paystack API instance with dynamic config
+    const paystackAPI = await getPaystackAPI();
+    const paystackResponse = await paystackAPI.post('/transaction/initialize', {
+      email: req.user.email,
+      amount: purchase.price * 100,
+      reference: newReference,
+      currency: settings.platform?.currency || 'GHS',
+      metadata: {
+        purchaseId: newPurchase._id,
+        retry: true,
+        originalReference: reference
       },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
-        }
-      }
-    );
+      ...(paystackConfig.subaccountCode && {
+        subaccount: paystackConfig.subaccountCode,
+        bearer: 'account'
+      })
+    });
 
     res.json({
       success: true,
@@ -951,7 +1283,8 @@ router.post('/retry/:reference', protect, async (req, res) => {
       data: {
         reference: newReference,
         amount: purchase.price,
-        paymentUrl: paystackResponse.data.data.authorization_url
+        paymentUrl: paystackResponse.data.data.authorization_url,
+        publicKey: paystackConfig.publicKey
       }
     });
 
@@ -965,7 +1298,7 @@ router.post('/retry/:reference', protect, async (req, res) => {
   }
 });
 
-// 9. Bulk Purchase Route
+// 10. Bulk Purchase Route
 router.post('/bulk', protect, async (req, res) => {
   try {
     console.log('Bulk purchase request received');
@@ -973,6 +1306,10 @@ router.post('/bulk', protect, async (req, res) => {
     console.log('User:', req.user.email, req.user._id);
     
     const { purchases, network, gateway = 'wallet' } = req.body;
+    
+    // Get system settings and Paystack config
+    const settings = await SystemSettings.getSettings();
+    const paystackConfig = await getPaystackConfig();
     
     if (!purchases || !Array.isArray(purchases) || purchases.length === 0) {
       console.log('Invalid purchases array:', purchases);
@@ -989,7 +1326,6 @@ router.post('/bulk', protect, async (req, res) => {
       });
     }
 
-    // Validate and prepare purchases
     const validatedPurchases = [];
     const errors = [];
     let totalCost = 0;
@@ -998,7 +1334,6 @@ router.post('/bulk', protect, async (req, res) => {
       const purchase = purchases[i];
       console.log(`Processing purchase ${i + 1}:`, purchase);
       
-      // Validate phone number - be more flexible with format
       let phoneNumber = purchase.phoneNumber?.toString().trim();
       if (!phoneNumber) {
         errors.push({
@@ -1009,7 +1344,6 @@ router.post('/bulk', protect, async (req, res) => {
         continue;
       }
 
-      // Clean phone number
       phoneNumber = phoneNumber.replace(/\D/g, '');
       if (phoneNumber.startsWith('233')) {
         phoneNumber = '0' + phoneNumber.substring(3);
@@ -1017,7 +1351,6 @@ router.post('/bulk', protect, async (req, res) => {
         phoneNumber = '0' + phoneNumber;
       }
 
-      // Validate format
       if (!/^0[2-9]\d{8}$/.test(phoneNumber)) {
         errors.push({
           index: i,
@@ -1027,7 +1360,6 @@ router.post('/bulk', protect, async (req, res) => {
         continue;
       }
 
-      // Validate capacity
       const capacity = parseFloat(purchase.capacity);
       if (!capacity || capacity < 0.1 || capacity > 100) {
         errors.push({
@@ -1038,10 +1370,8 @@ router.post('/bulk', protect, async (req, res) => {
         continue;
       }
 
-      // Use network from purchase or fall back to provided network
       const purchaseNetwork = purchase.network || network || 'MTN';
       
-      // Check stock and get pricing
       const stockCheck = await checkStockAvailability(purchaseNetwork, capacity, 'web');
       
       if (!stockCheck.available) {
@@ -1071,7 +1401,6 @@ router.post('/bulk', protect, async (req, res) => {
       totalCost
     });
 
-    // Check if any valid purchases
     if (validatedPurchases.length === 0) {
       return res.status(400).json({
         success: false,
@@ -1080,9 +1409,7 @@ router.post('/bulk', protect, async (req, res) => {
       });
     }
 
-    // Check wallet balance if wallet payment
     if (gateway === 'wallet') {
-      // Refresh user data to get latest balance
       const user = await User.findById(req.user._id);
       console.log('User wallet balance:', user.walletBalance, 'Total cost:', totalCost);
       
@@ -1097,11 +1424,9 @@ router.post('/bulk', protect, async (req, res) => {
         });
       }
 
-      // Generate batch reference
       const batchReference = generateReference('BULK');
       const purchaseIds = [];
 
-      // Create purchase records
       for (const validPurchase of validatedPurchases) {
         const purchase = await DataPurchase.create({
           userId: user._id,
@@ -1123,11 +1448,9 @@ router.post('/bulk', protect, async (req, res) => {
         purchaseIds.push(purchase._id);
       }
 
-      // Process wallet payment
       user.walletBalance -= totalCost;
       await user.save();
 
-      // Create transaction record
       await Transaction.create({
         userId: user._id,
         type: 'bulk_purchase',
@@ -1140,7 +1463,6 @@ router.post('/bulk', protect, async (req, res) => {
         description: `Bulk data purchase: ${validatedPurchases.length} items`
       });
 
-      // Update all purchases to processing (not completed)
       await DataPurchase.updateMany(
         { _id: { $in: purchaseIds } },
         { status: 'processing' }
@@ -1164,27 +1486,49 @@ router.post('/bulk', protect, async (req, res) => {
         }
       });
     } else {
-      // Initialize Paystack payment
-      const paystackResponse = await axios.post(
-        'https://api.paystack.co/transaction/initialize',
-        {
-          email: req.user.email,
-          amount: totalCost * 100,
-          reference: batchReference,
-          metadata: {
-            type: 'bulk_purchase',
-            purchaseIds,
-            userId: req.user._id,
-            totalItems: validatedPurchases.length
+      const batchReference = generateReference('BULK');
+      const purchaseIds = [];
+
+      for (const validPurchase of validatedPurchases) {
+        const purchase = await DataPurchase.create({
+          userId: req.user._id,
+          phoneNumber: validPurchase.phoneNumber,
+          network: validPurchase.network,
+          capacity: validPurchase.capacity,
+          gateway: 'paystack',
+          method: 'bulk_web',
+          price: validPurchase.price,
+          pricing: {
+            systemPrice: validPurchase.price,
+            customerPrice: validPurchase.price,
+            agentProfit: 0
           },
-          callback_url: `${process.env.FRONTEND_URL}/purchase/verify/${batchReference}`
+          reference: generateReference('PURCHASE'),
+          batchReference,
+          status: 'pending'
+        });
+        purchaseIds.push(purchase._id);
+      }
+
+      // Use the Paystack API instance with dynamic config
+      const paystackAPI = await getPaystackAPI();
+      const paystackResponse = await paystackAPI.post('/transaction/initialize', {
+        email: req.user.email,
+        amount: totalCost * 100,
+        reference: batchReference,
+        currency: settings.platform?.currency || 'GHS',
+        metadata: {
+          type: 'bulk_purchase',
+          purchaseIds,
+          userId: req.user._id,
+          totalItems: validatedPurchases.length
         },
-        {
-          headers: {
-            Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`
-          }
-        }
-      );
+        callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/purchase/verify/${batchReference}`,
+        ...(paystackConfig.subaccountCode && {
+          subaccount: paystackConfig.subaccountCode,
+          bearer: 'account'
+        })
+      });
 
       res.json({
         success: true,
@@ -1196,7 +1540,8 @@ router.post('/bulk', protect, async (req, res) => {
           purchases: validatedPurchases,
           errors: errors.length > 0 ? errors : undefined,
           paymentUrl: paystackResponse.data.data.authorization_url,
-          accessCode: paystackResponse.data.data.access_code
+          accessCode: paystackResponse.data.data.access_code,
+          publicKey: paystackConfig.publicKey
         }
       });
     }
@@ -1211,10 +1556,9 @@ router.post('/bulk', protect, async (req, res) => {
   }
 });
 
-// 10. Parse Excel/CSV for bulk purchase
+// 11. Parse Excel/CSV for bulk purchase
 router.post('/parse-excel', protect, upload.single('file'), async (req, res) => {
   try {
-    // Debug logging
     console.log('File upload request received');
     console.log('File:', req.file);
     console.log('Body:', req.body);
@@ -1228,22 +1572,18 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
 
     const { network } = req.body;
 
-    // Check file type
     const fileType = req.file.mimetype;
     console.log('File type:', fileType);
 
-    // Parse the file based on type
     let data;
     try {
       if (fileType === 'text/csv' || fileType === 'application/csv' || fileType === 'text/plain') {
-        // For CSV files, convert to Excel format first
         const csvText = req.file.buffer.toString('utf8');
         const workbook = XLSX.read(csvText, { type: 'string' });
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
         data = XLSX.utils.sheet_to_json(sheet, { raw: false });
       } else {
-        // For Excel files
         const workbook = XLSX.read(req.file.buffer, { type: 'buffer' });
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
@@ -1266,7 +1606,6 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
       });
     }
 
-    // Process and validate data
     const purchases = [];
     const errors = [];
 
@@ -1274,7 +1613,6 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
       const row = data[i];
       console.log('Processing row:', i + 1, row);
       
-      // Try to extract phone number and capacity from different possible column names
       let phoneNumber = row['Phone Number'] || row['phone'] || row['phoneNumber'] || 
                        row['Phone'] || row['Number'] || row['Mobile'] || row['Tel'];
       
@@ -1284,7 +1622,6 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
       let rowNetwork = row['Network'] || row['network'] || row['Provider'] || row['Carrier'] ||
                       row['Network (Optional)'];
 
-      // Clean and validate phone number
       if (phoneNumber) {
         phoneNumber = phoneNumber.toString().replace(/\D/g, '');
         if (phoneNumber.startsWith('233')) {
@@ -1294,15 +1631,13 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
         }
       }
 
-      // Parse capacity
       if (capacity) {
         capacity = parseFloat(capacity.toString().replace(/[^\d.]/g, ''));
       }
 
-      // Validate
       if (!phoneNumber) {
         errors.push({
-          row: i + 2, // Excel rows start at 1, plus header
+          row: i + 2,
           error: 'Missing phone number'
         });
         continue;
@@ -1316,7 +1651,6 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
         continue;
       }
 
-      // Use provided network or default
       const finalNetwork = rowNetwork || network || 'MTN';
 
       purchases.push({
@@ -1350,10 +1684,9 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
   }
 });
 
-// 11. Get bulk purchase template
+// 12. Get bulk purchase template
 router.get('/bulk-template', (req, res) => {
   try {
-    // Create a sample Excel template
     const templateData = [
       { 'Phone Number': '0241234567', 'Capacity (GB)': '2', 'Network (Optional)': 'MTN' },
       { 'Phone Number': '0551234567', 'Capacity (GB)': '5', 'Network (Optional)': 'TELECEL' },
@@ -1364,7 +1697,6 @@ router.get('/bulk-template', (req, res) => {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Bulk Purchase Template');
 
-    // Generate buffer
     const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1380,7 +1712,7 @@ router.get('/bulk-template', (req, res) => {
   }
 });
 
-// Get pricing
+// 13. Get pricing
 router.get('/pricing', asyncHandler(async (req, res) => {
   const { 
     network, 
@@ -1391,7 +1723,6 @@ router.get('/pricing', asyncHandler(async (req, res) => {
     order = 'asc' 
   } = req.query;
 
-  // Build filter
   const filter = {};
   
   if (network) filter.network = network;
@@ -1403,12 +1734,10 @@ router.get('/pricing', asyncHandler(async (req, res) => {
   }
 
   try {
-    // Fetch pricing data
     const pricingData = await DataPricing.find(filter)
       .populate('lastUpdatedBy', 'name email')
       .sort({ [sortBy]: order === 'desc' ? -1 : 1 });
 
-    // Get statistics
     const stats = {
       total: pricingData.length,
       inStock: pricingData.filter(p => p.stock?.overallInStock).length,
@@ -1418,7 +1747,6 @@ router.get('/pricing', asyncHandler(async (req, res) => {
       popular: pricingData.filter(p => p.isPopular).length
     };
 
-    // Calculate average margins
     const margins = pricingData.map(p => {
       const adminCost = p.prices.adminCost;
       const userPrice = p.prices.user;
@@ -1444,5 +1772,24 @@ router.get('/pricing', asyncHandler(async (req, res) => {
     });
   }
 }));
+
+// 14. NEW: Admin cleanup endpoint (manual trigger)
+router.delete('/admin/cleanup-pending', protect, adminOnly, async (req, res) => {
+  try {
+    const deleted = await deleteAbandonedOrders();
+    
+    res.json({
+      success: true,
+      message: `Cleanup completed. Deleted ${deleted} abandoned orders.`,
+      deletedCount: deleted
+    });
+  } catch (error) {
+    console.error('Manual cleanup error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Cleanup failed'
+    });
+  }
+});
 
 module.exports = router;
