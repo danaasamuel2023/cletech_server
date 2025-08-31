@@ -513,7 +513,7 @@ const DataPurchaseSchema = new mongoose.Schema({
   userId: { 
     type: mongoose.Schema.Types.ObjectId, 
     ref: "Usermodal", 
-    required: true 
+    required: false 
   },
   agentId: {
     type: mongoose.Schema.Types.ObjectId,
@@ -612,7 +612,7 @@ DataPurchaseSchema.index({ reference: 1 });
 const TransactionSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
+    ref: 'Usermodal',
     required: true
   },
   type: {
@@ -777,7 +777,7 @@ ResultCheckerSchema.index({ pin: 1 });
 const ApiKeySchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
+    ref: 'Usermodal',
     required: true
   },
   key: {
@@ -836,7 +836,7 @@ ApiKeySchema.index({ userId: 1 });
 const NotificationSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: "User",
+    ref: "UUsermodalser",
     required: function() { return !this.isGlobal; }
   },
   isGlobal: {
@@ -886,7 +886,7 @@ NotificationSchema.index({ createdAt: -1 });
 const AgentProfitSchema = new mongoose.Schema({
   agentId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: "User",
+    ref: "Usermodal",
     required: true
   },
   purchaseId: {
@@ -896,8 +896,8 @@ const AgentProfitSchema = new mongoose.Schema({
   },
   customerId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: "User",
-    required: true
+    ref: "Usermodal",
+    required: false
   },
   network: {
     type: String,

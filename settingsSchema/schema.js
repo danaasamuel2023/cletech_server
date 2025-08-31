@@ -489,7 +489,7 @@ const SystemSettingsSchema = new mongoose.Schema({
   // Metadata
   lastUpdatedBy: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
+    ref: 'Usermodal'
   },
   lastUpdatedAt: {
     type: Date,
