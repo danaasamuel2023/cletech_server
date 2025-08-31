@@ -667,7 +667,7 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         isStorePurchase: true,
         customerName: customerName || 'Guest'
       },
-      callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/${subdomain}/store?reference=${reference}`,
+callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/store/${reference}?subdomain=${subdomain}`,
       channels: ['card', 'bank', 'mobile_money'],
       ...(paystackConfig.subaccountCode && {
         subaccount: paystackConfig.subaccountCode,
