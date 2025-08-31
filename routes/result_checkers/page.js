@@ -692,5 +692,112 @@ async function completePurchase(metadata, reference, gateway) {
     session.endSession();
   }
 }
+// ==================== STATS ROUTE ====================
+// Add this single route to your existing result checker routes file
+
+// Get result checker statistics (Admin only)
+router.get('/admin/stats',
+  protect,
+  asyncHandler(async (req, res) => {
+    // Check if admin
+    if (req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin access required'
+      });
+    }
+
+    // Get overall statistics
+    const stats = await ResultChecker.aggregate([
+      {
+        $facet: {
+          // Count by status
+          statusCounts: [
+            {
+              $group: {
+                _id: '$status',
+                count: { $sum: 1 },
+                totalValue: { $sum: '$price' }
+              }
+            }
+          ],
+          // Total count
+          totalCount: [
+            {
+              $count: 'total'
+            }
+          ],
+          // Revenue from sold items
+          revenue: [
+            {
+              $match: { status: 'sold' }
+            },
+            {
+              $group: {
+                _id: null,
+                totalRevenue: { $sum: '$soldTo.soldPrice' },
+                count: { $sum: 1 }
+              }
+            }
+          ],
+          // Recent sales (last 30 days)
+          recentSales: [
+            {
+              $match: {
+                status: 'sold',
+                'soldTo.soldAt': {
+                  $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+                }
+              }
+            },
+            {
+              $count: 'count'
+            }
+          ],
+          // Today's sales
+          todaySales: [
+            {
+              $match: {
+                status: 'sold',
+                'soldTo.soldAt': {
+                  $gte: new Date(new Date().setHours(0, 0, 0, 0))
+                }
+              }
+            },
+            {
+              $count: 'count'
+            }
+          ]
+        }
+      }
+    ]);
+
+    // Process the aggregation results
+    const statusMap = {};
+    stats[0].statusCounts.forEach(item => {
+      statusMap[item._id] = {
+        count: item.count,
+        value: item.totalValue
+      };
+    });
+
+    const result = {
+      total: stats[0].totalCount[0]?.total || 0,
+      available: statusMap.available?.count || 0,
+      sold: statusMap.sold?.count || 0,
+      used: statusMap.used?.count || 0,
+      expired: statusMap.expired?.count || 0,
+      totalValue: Object.values(statusMap).reduce((sum, item) => sum + (item.value || 0), 0),
+      totalRevenue: stats[0].revenue[0]?.totalRevenue || 0,
+      recentSales: stats[0].recentSales[0]?.count || 0,
+      todaySales: stats[0].todaySales[0]?.count || 0
+    };
+
+    res.json({
+      success: true,
+      data: result
+    });
+  })
+);
 
 module.exports = router;
