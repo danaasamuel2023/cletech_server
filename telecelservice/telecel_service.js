@@ -112,7 +112,7 @@ class TelecelService {
     }
   }
 }
-
+ 
 // Create singleton instance
 const telecelService = new TelecelService();
 
