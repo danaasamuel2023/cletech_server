@@ -1,15 +1,18 @@
-// ==================== routes/purchase.js - COMPLETE UPDATED FILE ====================
-// Complete Purchase Routes with Webhook Handler, Auto-Delete, and All Features
+// ==================== routes/purchase.js - UPDATED WITH TELECEL INTEGRATION ====================
+// Complete Purchase Routes with Telecel Auto-Processing
 
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const axios = require('axios');
-const crypto = require('crypto'); // ADDED for webhook signature
-const cron = require('node-cron'); // ADDED for scheduled cleanup
+const crypto = require('crypto');
+const cron = require('node-cron');
 const multer = require('multer');
 const XLSX = require('xlsx');
 const { adminOnly, asyncHandler, validate } = require('../../middleware/middleware');
+
+// Import Telecel Service
+const telecelService = require('../../telecelservice/telecel_service');
 
 const { 
   DataPurchase, 
@@ -21,7 +24,6 @@ const {
   AgentProfit 
 } = require('../../Schema/Schema');
 const SystemSettings = require('../../settingsSchema/schema');
-
 
 // ==================== MIDDLEWARE ====================
 const jwt = require('jsonwebtoken');
@@ -99,9 +101,72 @@ const upload = multer({
   }
 });
 
-// ==================== PAYSTACK CONFIGURATION ====================
+// ==================== TELECEL PROCESSING FUNCTION ====================
+const processTelecelPurchase = async (purchase) => {
+  try {
+    console.log(`[TELECEL PROCESSOR] Processing purchase ${purchase.reference}`);
+    
+    // Send data bundle via Telecel API
+    const result = await telecelService.sendDataBundle(
+      purchase.phoneNumber,
+      purchase.capacity
+    );
 
-// Get Paystack configuration from SystemSettings
+    if (result.success) {
+      // Update purchase status to completed
+      purchase.status = 'completed';
+      purchase.deliveredAt = new Date();
+      purchase.deliveryDetails = {
+        provider: 'TELECEL',
+        transactionId: result.transactionId,
+        message: result.message,
+        processedAt: new Date()
+      };
+      await purchase.save();
+
+      console.log(`[TELECEL PROCESSOR] Successfully delivered ${purchase.capacity}GB to ${purchase.phoneNumber}`);
+      
+      // Create notification for user if exists
+      if (purchase.userId) {
+        const Notification = require('../../Schema/Schema').Notification;
+        await Notification.create({
+          userId: purchase.userId,
+          title: 'Data Bundle Delivered',
+          message: `Your ${purchase.capacity}GB TELECEL data bundle has been successfully delivered to ${purchase.phoneNumber}`,
+          type: 'success',
+          category: 'purchase'
+        });
+      }
+
+      return true;
+    } else {
+      // Handle failure
+      console.error(`[TELECEL PROCESSOR] Failed to deliver: ${result.error}`);
+      
+      // If token expired, mark for manual processing
+      if (result.requiresNewToken) {
+        purchase.status = 'failed';
+        purchase.failureReason = 'Authentication token expired - requires manual update';
+        purchase.adminNotes = 'TELECEL API token needs to be renewed';
+      } else {
+        purchase.status = 'failed';
+        purchase.failureReason = result.error;
+      }
+      
+      await purchase.save();
+      
+      return false;
+    }
+  } catch (error) {
+    console.error('[TELECEL PROCESSOR] Error:', error);
+    purchase.status = 'failed';
+    purchase.failureReason = error.message;
+    await purchase.save();
+    return false;
+  }
+};
+
+// ==================== PAYSTACK CONFIGURATION ====================
 const getPaystackConfig = async () => {
   const settings = await SystemSettings.getSettings();
   
@@ -127,7 +192,6 @@ const getPaystackConfig = async () => {
   };
 };
 
-// Create Paystack API instance with dynamic config
 const getPaystackAPI = async () => {
   const config = await getPaystackConfig();
   
@@ -174,15 +238,12 @@ const checkValidation = (req, res, next) => {
 };
 
 // ==================== HELPER FUNCTIONS ====================
-
-// Generate unique reference
 const generateReference = (prefix = 'REF') => {
   const timestamp = Date.now();
   const random = Math.random().toString(36).substring(2, 9).toUpperCase();
   return `${prefix}-${timestamp}-${random}`;
 };
 
-// Get user's price based on role
 const getUserPrice = (pricing, userRole) => {
   const roleMap = {
     'admin': pricing.prices.adminCost,
@@ -194,7 +255,6 @@ const getUserPrice = (pricing, userRole) => {
   return roleMap[userRole] || pricing.prices.user;
 };
 
-// Check stock availability
 const checkStockAvailability = async (network, capacity, method = 'web') => {
   try {
     const inventory = await DataInventory.findOne({ network });
@@ -263,7 +323,6 @@ const checkStockAvailability = async (network, capacity, method = 'web') => {
   }
 };
 
-// Process wallet payment
 const processWalletPayment = async (userId, amount, reference, purchase) => {
   try {
     const user = await User.findById(userId);
@@ -291,19 +350,22 @@ const processWalletPayment = async (userId, amount, reference, purchase) => {
     purchase.status = 'processing';
     await purchase.save();
 
+    // Process TELECEL purchases immediately
+    if (purchase.network === 'TELECEL') {
+      await processTelecelPurchase(purchase);
+    }
+
     return { success: true, newBalance: user.walletBalance };
   } catch (error) {
     throw error;
   }
 };
 
-// NEW: Update store statistics (used by webhook)
 const updateStoreStatistics = async (purchase) => {
   try {
     if (purchase.method === 'agent_store' && purchase.agentId) {
       console.log(`[WEBHOOK] Updating store stats for agent: ${purchase.agentId}`);
       
-      // 1. Update Agent User Profit Balance
       const agent = await User.findById(purchase.agentId);
       if (agent) {
         const profitAmount = purchase.pricing.agentProfit || 0;
@@ -313,7 +375,6 @@ const updateStoreStatistics = async (purchase) => {
         console.log(`[WEBHOOK] Updated agent profit: +${profitAmount} GHS`);
       }
 
-      // 2. Update Agent Profit Record
       await AgentProfit.findOneAndUpdate(
         { purchaseId: purchase._id },
         { 
@@ -322,7 +383,6 @@ const updateStoreStatistics = async (purchase) => {
         }
       );
 
-      // 3. Update Store Statistics - COMPREHENSIVE UPDATE
       const storeUpdate = await AgentStore.findOneAndUpdate(
         { agent: purchase.agentId },
         {
@@ -353,7 +413,6 @@ const updateStoreStatistics = async (purchase) => {
   }
 };
 
-// NEW: Auto-delete abandoned orders
 const deleteAbandonedOrders = async () => {
   try {
     const cutoffTime = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes ago
@@ -391,12 +450,12 @@ const deleteAbandonedOrders = async () => {
   }
 };
 
-// NEW: Schedule cleanup to run every 2 minutes
+// Schedule cleanup to run every 2 minutes
 cron.schedule('*/2 * * * *', async () => {
   await deleteAbandonedOrders();
 });
 
-// NEW: Run initial cleanup on startup
+// Run initial cleanup on startup
 deleteAbandonedOrders().then(count => {
   console.log(`[STARTUP] Initial cleanup completed. Deleted ${count} abandoned orders.`);
 });
@@ -409,7 +468,6 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
     const { phoneNumber, network, capacity, gateway } = req.body;
     const userId = req.user._id;
 
-    // Get system settings
     const settings = await SystemSettings.getSettings();
     const paystackConfig = await getPaystackConfig();
 
@@ -470,7 +528,6 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
         }
       });
     } else {
-      // Use the Paystack API instance with dynamic config
       const paystackAPI = await getPaystackAPI();
       const paystackResponse = await paystackAPI.post('/transaction/initialize', {
         email: req.user.email,
@@ -519,7 +576,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
   }
 });
 
-// 2. Purchase through agent store (UPDATED WITH FIXES)
+// 2. Purchase through agent store
 router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation, async (req, res) => {
   try {
     const { subdomain } = req.params;
@@ -533,7 +590,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       timestamp: new Date().toISOString() 
     });
 
-    // Get system settings
     const settings = await SystemSettings.getSettings();
     const paystackConfig = await getPaystackConfig();
 
@@ -592,7 +648,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
 
     const reference = generateReference('STORE');
 
-    // CRITICAL: Create purchase with PENDING status
     const purchase = await DataPurchase.create({
       userId: req.user?._id || null,
       agentId: store.agent._id,
@@ -609,7 +664,7 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         agentProfit
       },
       reference,
-      status: 'pending', // ALWAYS PENDING
+      status: 'pending',
       storeInfo: {
         storeId: store._id,
         storeName: store.storeName,
@@ -647,7 +702,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       status: 'pending'
     });
 
-    // Initialize Paystack payment - ALWAYS REQUIRED
     console.log('Initializing Paystack payment...');
     
     const paystackPayload = {
@@ -667,7 +721,7 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         isStorePurchase: true,
         customerName: customerName || 'Guest'
       },
-callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/store/${reference}?subdomain=${subdomain}`,
+      callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/store/${reference}?subdomain=${subdomain}`,
       channels: ['card', 'bank', 'mobile_money'],
       ...(paystackConfig.subaccountCode && {
         subaccount: paystackConfig.subaccountCode,
@@ -675,7 +729,6 @@ callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/
       })
     };
 
-    // Use the Paystack API instance with dynamic config
     const paystackAPI = await getPaystackAPI();
     const paystackResponse = await paystackAPI.post('/transaction/initialize', paystackPayload);
 
@@ -696,7 +749,7 @@ callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/
     res.json({
       success: true,
       message: 'Payment initialization successful',
-      requiresPayment: true, // CRITICAL FLAG
+      requiresPayment: true,
       data: {
         reference: purchase.reference,
         amount: agentPrice,
@@ -735,12 +788,11 @@ callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/
   }
 });
 
-// 3. NEW: PAYSTACK WEBHOOK HANDLER
+// 3. PAYSTACK WEBHOOK HANDLER - UPDATED WITH TELECEL PROCESSING
 router.post('/webhook/paystack', async (req, res) => {
   try {
     console.log('[WEBHOOK] Received Paystack webhook');
     
-    // Get Paystack config for webhook verification
     const paystackConfig = await getPaystackConfig();
     
     // Verify webhook signature
@@ -759,7 +811,6 @@ router.post('/webhook/paystack', async (req, res) => {
     console.log(`[WEBHOOK] Reference: ${event.data?.reference}`);
 
     switch (event.event) {
-      // SUCCESSFUL PAYMENT
       case 'charge.success':
         const successData = event.data;
         const successReference = successData.reference;
@@ -794,6 +845,12 @@ router.post('/webhook/paystack', async (req, res) => {
 
         console.log(`[WEBHOOK] Purchase updated to processing: ${successReference}`);
 
+        // Process TELECEL purchases automatically
+        if (purchase.network === 'TELECEL') {
+          console.log(`[WEBHOOK] Processing TELECEL purchase automatically`);
+          await processTelecelPurchase(purchase);
+        }
+
         // Update store statistics if it's a store purchase
         if (purchase.method === 'agent_store') {
           await updateStoreStatistics(purchase);
@@ -820,7 +877,6 @@ router.post('/webhook/paystack', async (req, res) => {
         res.status(200).send('OK');
         break;
 
-      // FAILED PAYMENT
       case 'charge.failed':
         const failedData = event.data;
         const failedReference = failedData.reference;
@@ -851,7 +907,6 @@ router.post('/webhook/paystack', async (req, res) => {
         res.status(200).send('OK');
         break;
 
-      // REFUND
       case 'refund.processed':
         const refundData = event.data;
         const refundReference = refundData.transaction_reference;
@@ -913,7 +968,7 @@ router.post('/webhook/paystack', async (req, res) => {
   }
 });
 
-// 4. Verify payment (kept for backward compatibility)
+// 4. Verify payment - UPDATED WITH TELECEL PROCESSING
 router.get('/verify/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
@@ -943,7 +998,6 @@ router.get('/verify/:reference', async (req, res) => {
       });
     }
 
-    // Use the Paystack API instance with dynamic config
     const paystackAPI = await getPaystackAPI();
     const verifyResponse = await paystackAPI.get(`/transaction/verify/${reference}`);
 
@@ -954,6 +1008,12 @@ router.get('/verify/:reference', async (req, res) => {
         purchase.status = 'processing';
         purchase.paystackReference = paymentData.reference;
         await purchase.save();
+
+        // Process TELECEL purchases automatically
+        if (purchase.network === 'TELECEL') {
+          console.log(`[VERIFY] Processing TELECEL purchase automatically`);
+          await processTelecelPurchase(purchase);
+        }
 
         if (purchase.method === 'agent_store') {
           await updateStoreStatistics(purchase);
@@ -986,7 +1046,8 @@ router.get('/verify/:reference', async (req, res) => {
             network: p.network,
             capacity: p.capacity,
             phoneNumber: p.phoneNumber,
-            price: p.price
+            price: p.price,
+            status: p.status
           }))
         }
       });
@@ -1245,7 +1306,6 @@ router.post('/retry/:reference', protect, async (req, res) => {
       });
     }
 
-    // Get system settings and Paystack config
     const settings = await SystemSettings.getSettings();
     const paystackConfig = await getPaystackConfig();
 
@@ -1259,7 +1319,6 @@ router.post('/retry/:reference', protect, async (req, res) => {
       createdAt: new Date()
     });
 
-    // Use the Paystack API instance with dynamic config
     const paystackAPI = await getPaystackAPI();
     const paystackResponse = await paystackAPI.post('/transaction/initialize', {
       email: req.user.email,
@@ -1298,7 +1357,7 @@ router.post('/retry/:reference', protect, async (req, res) => {
   }
 });
 
-// 10. Bulk Purchase Route
+// 10. Bulk Purchase Route - UPDATED WITH TELECEL PROCESSING
 router.post('/bulk', protect, async (req, res) => {
   try {
     console.log('Bulk purchase request received');
@@ -1307,7 +1366,6 @@ router.post('/bulk', protect, async (req, res) => {
     
     const { purchases, network, gateway = 'wallet' } = req.body;
     
-    // Get system settings and Paystack config
     const settings = await SystemSettings.getSettings();
     const paystackConfig = await getPaystackConfig();
     
@@ -1446,6 +1504,11 @@ router.post('/bulk', protect, async (req, res) => {
           status: 'processing'
         });
         purchaseIds.push(purchase._id);
+
+        // Process TELECEL purchases immediately
+        if (purchase.network === 'TELECEL') {
+          await processTelecelPurchase(purchase);
+        }
       }
 
       user.walletBalance -= totalCost;
@@ -1462,11 +1525,6 @@ router.post('/bulk', protect, async (req, res) => {
         status: 'completed',
         description: `Bulk data purchase: ${validatedPurchases.length} items`
       });
-
-      await DataPurchase.updateMany(
-        { _id: { $in: purchaseIds } },
-        { status: 'processing' }
-      );
 
       res.json({
         success: true,
@@ -1510,7 +1568,6 @@ router.post('/bulk', protect, async (req, res) => {
         purchaseIds.push(purchase._id);
       }
 
-      // Use the Paystack API instance with dynamic config
       const paystackAPI = await getPaystackAPI();
       const paystackResponse = await paystackAPI.post('/transaction/initialize', {
         email: req.user.email,
@@ -1773,7 +1830,7 @@ router.get('/pricing', asyncHandler(async (req, res) => {
   }
 }));
 
-// 14. NEW: Admin cleanup endpoint (manual trigger)
+// 14. Admin cleanup endpoint (manual trigger)
 router.delete('/admin/cleanup-pending', protect, adminOnly, async (req, res) => {
   try {
     const deleted = await deleteAbandonedOrders();
@@ -1788,6 +1845,64 @@ router.delete('/admin/cleanup-pending', protect, adminOnly, async (req, res) => 
     res.status(500).json({
       success: false,
       message: 'Cleanup failed'
+    });
+  }
+});
+
+// 15. Manual TELECEL processing endpoint (for admin)
+router.post('/admin/process-telecel/:reference', protect, adminOnly, async (req, res) => {
+  try {
+    const { reference } = req.params;
+    
+    const purchase = await DataPurchase.findOne({ reference });
+    
+    if (!purchase) {
+      return res.status(404).json({
+        success: false,
+        message: 'Purchase not found'
+      });
+    }
+
+    if (purchase.network !== 'TELECEL') {
+      return res.status(400).json({
+        success: false,
+        message: 'This purchase is not for TELECEL network'
+      });
+    }
+
+    if (purchase.status === 'completed') {
+      return res.json({
+        success: true,
+        message: 'Purchase already completed'
+      });
+    }
+
+    const result = await processTelecelPurchase(purchase);
+    
+    if (result) {
+      res.json({
+        success: true,
+        message: 'TELECEL bundle delivered successfully',
+        data: {
+          reference: purchase.reference,
+          status: purchase.status,
+          deliveredAt: purchase.deliveredAt
+        }
+      });
+    } else {
+      res.status(400).json({
+        success: false,
+        message: 'Failed to deliver TELECEL bundle',
+        error: purchase.failureReason
+      });
+    }
+    
+  } catch (error) {
+    console.error('Manual TELECEL processing error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Processing failed',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
