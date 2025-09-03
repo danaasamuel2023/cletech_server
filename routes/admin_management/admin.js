@@ -78,6 +78,9 @@ router.get('/users', asyncHandler(async (req, res) => {
 // @route   GET /api/admin/users/:userId/purchases
 // @desc    Get all purchases for a specific user
 // @access  Admin
+// @route   GET /api/admin/users/:userId/purchases
+// @desc    Get all purchases for a specific user with balance information
+// @access  Admin
 router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
   const { userId } = req.params;
   const { 
@@ -131,11 +134,116 @@ router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
     .populate('agentId', 'name email')
     .sort({ [sortBy]: order === 'desc' ? -1 : 1 })
     .limit(limit * 1)
-    .skip((page - 1) * limit);
+    .skip((page - 1) * limit)
+    .lean(); // Use lean() for better performance
+
+  // Enrich purchases with balance information from transactions
+  const purchasesWithBalance = await Promise.all(
+    purchases.map(async (purchase) => {
+      let balanceInfo = null;
+      
+      try {
+        // Method 1: Try to find a transaction with relatedPurchaseId
+        let transaction = await Transaction.findOne({
+          userId: purchase.userId,
+          relatedPurchaseId: purchase._id
+        }).select('balanceBefore balanceAfter amount createdAt').lean();
+        
+        // Method 2: If not found by relatedPurchaseId, try by exact reference match
+        if (!transaction) {
+          transaction = await Transaction.findOne({
+            userId: purchase.userId,
+            reference: purchase.reference
+          }).select('balanceBefore balanceAfter amount createdAt').lean();
+        }
+        
+        // Method 3: Try to find by reference pattern matching
+        if (!transaction) {
+          transaction = await Transaction.findOne({
+            userId: purchase.userId,
+            $or: [
+              { reference: { $regex: purchase.reference, $options: 'i' } },
+              { description: { $regex: purchase.reference, $options: 'i' } }
+            ]
+          }).select('balanceBefore balanceAfter amount createdAt').lean();
+        }
+        
+        // Method 4: Try to find by batch reference if it exists
+        if (!transaction && purchase.batchReference) {
+          transaction = await Transaction.findOne({
+            userId: purchase.userId,
+            reference: purchase.batchReference
+          }).select('balanceBefore balanceAfter amount createdAt').lean();
+        }
+        
+        // Method 5: Last resort - find by timestamp and amount (within 2 minutes)
+        if (!transaction) {
+          const purchaseTime = new Date(purchase.createdAt).getTime();
+          const timeBefore = new Date(purchaseTime - 120000); // 2 minutes before
+          const timeAfter = new Date(purchaseTime + 120000);  // 2 minutes after
+          
+          transaction = await Transaction.findOne({
+            userId: purchase.userId,
+            type: { $in: ['data_purchase', 'wallet_deduction', 'purchase', 'bulk_purchase'] },
+            createdAt: {
+              $gte: timeBefore,
+              $lte: timeAfter
+            },
+            // Allow for small price variations (within 10%)
+            amount: { 
+              $gte: purchase.price * 0.9, 
+              $lte: purchase.price * 1.1 
+            }
+          }).select('balanceBefore balanceAfter amount createdAt').lean();
+        }
+        
+        // If transaction found, extract balance info
+        if (transaction) {
+          balanceInfo = {
+            balanceBefore: transaction.balanceBefore,
+            balanceAfter: transaction.balanceAfter,
+            transactionAmount: transaction.amount,
+            transactionDate: transaction.createdAt
+          };
+        }
+        
+        // For refunded purchases, try to find the refund transaction
+        if (purchase.status === 'refunded' && !balanceInfo) {
+          const refundTransaction = await Transaction.findOne({
+            userId: purchase.userId,
+            type: 'refund',
+            $or: [
+              { reference: `REFUND-${purchase.reference}` },
+              { relatedPurchaseId: purchase._id },
+              { description: { $regex: `refund.*${purchase.reference}`, $options: 'i' } }
+            ]
+          }).select('balanceBefore balanceAfter amount createdAt').lean();
+          
+          if (refundTransaction) {
+            balanceInfo = {
+              balanceBefore: refundTransaction.balanceBefore,
+              balanceAfter: refundTransaction.balanceAfter,
+              transactionAmount: refundTransaction.amount,
+              transactionDate: refundTransaction.createdAt,
+              isRefund: true
+            };
+          }
+        }
+        
+      } catch (error) {
+        console.error(`Error fetching balance for purchase ${purchase._id}:`, error);
+      }
+      
+      return {
+        ...purchase,
+        balanceInfo
+      };
+    })
+  );
 
   const total = await DataPurchase.countDocuments(filter);
 
-  // Calculate statistics
+  // Calculate statistics with balance tracking
   const stats = await DataPurchase.aggregate([
     { $match: { userId: new mongoose.Types.ObjectId(userId) } },
     {
@@ -144,7 +252,19 @@ router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
         totalAmount: { $sum: '$price' },
         totalPurchases: { $sum: 1 },
         avgPurchaseValue: { $avg: '$price' },
-        totalCapacity: { $sum: '$capacity' }
+        totalCapacity: { $sum: '$capacity' },
+        completedPurchases: {
+          $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
+        },
+        failedPurchases: {
+          $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] }
+        },
+        refundedPurchases: {
+          $sum: { $cond: [{ $eq: ['$status', 'refunded'] }, 1, 0] }
+        },
+        pendingPurchases: {
+          $sum: { $cond: [{ $eq: ['$status', 'pending'] }, 1, 0] }
+        }
       }
     }
   ]);
@@ -157,7 +277,11 @@ router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
         _id: '$network',
         count: { $sum: 1 },
         totalAmount: { $sum: '$price' },
-        totalCapacity: { $sum: '$capacity' }
+        totalCapacity: { $sum: '$capacity' },
+        avgCapacity: { $avg: '$capacity' },
+        completedCount: {
+          $sum: { $cond: [{ $eq: ['$status', 'completed'] }, 1, 0] }
+        }
       }
     },
     { $sort: { totalAmount: -1 } }
@@ -173,6 +297,19 @@ router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
         totalAmount: { $sum: '$price' }
       }
     }
+  ]);
+
+  // Get breakdown by gateway
+  const gatewayBreakdown = await DataPurchase.aggregate([
+    { $match: { userId: new mongoose.Types.ObjectId(userId) } },
+    {
+      $group: {
+        _id: '$gateway',
+        count: { $sum: 1 },
+        totalAmount: { $sum: '$price' }
+      }
+    },
+    { $sort: { count: -1 } }
   ]);
 
   // Get today's stats if not filtering by today only
@@ -194,11 +331,58 @@ router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
         $group: {
           _id: null,
           todayTotal: { $sum: '$price' },
-          todayCount: { $sum: 1 }
+          todayCount: { $sum: 1 },
+          todayCapacity: { $sum: '$capacity' }
         }
       }
     ]);
   }
+
+  // Get last 30 days trend
+  const thirtyDaysAgo = new Date();
+  thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+  
+  const dailyTrend = await DataPurchase.aggregate([
+    {
+      $match: {
+        userId: new mongoose.Types.ObjectId(userId),
+        createdAt: { $gte: thirtyDaysAgo }
+      }
+    },
+    {
+      $group: {
+        _id: {
+          $dateToString: { format: "%Y-%m-%d", date: "$createdAt" }
+        },
+        dailyAmount: { $sum: '$price' },
+        dailyCount: { $sum: 1 },
+        dailyCapacity: { $sum: '$capacity' }
+      }
+    },
+    { $sort: { _id: 1 } }
+  ]);
+
+  // Calculate wallet balance history from transactions
+  const balanceHistory = await Transaction.aggregate([
+    {
+      $match: {
+        userId: new mongoose.Types.ObjectId(userId),
+        status: 'completed'
+      }
+    },
+    { $sort: { createdAt: -1 } },
+    { $limit: 10 },
+    {
+      $project: {
+        date: '$createdAt',
+        balanceBefore: 1,
+        balanceAfter: 1,
+        amount: 1,
+        type: 1,
+        reference: 1
+      }
+    }
+  ]);
 
   res.status(200).json({
     success: true,
@@ -209,22 +393,32 @@ router.get('/users/:userId/purchases', asyncHandler(async (req, res) => {
         email: user.email,
         phoneNumber: user.phoneNumber,
         role: user.role,
-        walletBalance: user.walletBalance
+        walletBalance: user.walletBalance,
+        totalEarnings: user.totalEarnings || 0,
+        agentProfit: user.agentProfit || 0
       },
-      purchases,
+      purchases: purchasesWithBalance,
       statistics: {
         overall: stats[0] || {
           totalAmount: 0,
           totalPurchases: 0,
           avgPurchaseValue: 0,
-          totalCapacity: 0
+          totalCapacity: 0,
+          completedPurchases: 0,
+          failedPurchases: 0,
+          refundedPurchases: 0,
+          pendingPurchases: 0
         },
         today: todayOnly === 'true' ? null : (todayStats?.[0] || {
           todayTotal: 0,
-          todayCount: 0
+          todayCount: 0,
+          todayCapacity: 0
         }),
         byNetwork: networkBreakdown || [],
-        byStatus: statusBreakdown || []
+        byStatus: statusBreakdown || [],
+        byGateway: gatewayBreakdown || [],
+        dailyTrend: dailyTrend || [],
+        balanceHistory: balanceHistory || []
       },
       pagination: {
         total,
