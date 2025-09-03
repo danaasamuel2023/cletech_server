@@ -1,5 +1,5 @@
-// ==================== routes/purchase.js - UPDATED WITH TELECEL INTEGRATION ====================
-// Complete Purchase Routes with Telecel Auto-Processing
+// ==================== routes/Datapurchase/order.js ====================
+// Complete Purchase Routes with Fixed Telecel Integration
 
 const express = require('express');
 const router = express.Router();
@@ -11,8 +11,9 @@ const multer = require('multer');
 const XLSX = require('xlsx');
 const { adminOnly, asyncHandler, validate } = require('../../middleware/middleware');
 
-// Import Telecel Service
-const telecelService = require('../../telecelservice/telecel_service');
+// FIXED: Import TelecelService class and create instance
+const TelecelService = require('../../telecelservice/telecel_service');
+const telecelService = new TelecelService(); // Create instance here
 
 const { 
   DataPurchase, 
@@ -21,7 +22,8 @@ const {
   DataPricing, 
   DataInventory, 
   AgentStore, 
-  AgentProfit 
+  AgentProfit,
+  Notification 
 } = require('../../Schema/Schema');
 const SystemSettings = require('../../settingsSchema/schema');
 
@@ -105,12 +107,21 @@ const upload = multer({
 const processTelecelPurchase = async (purchase) => {
   try {
     console.log(`[TELECEL PROCESSOR] Processing purchase ${purchase.reference}`);
+    console.log(`[TELECEL PROCESSOR] Network: ${purchase.network}, Capacity: ${purchase.capacity}GB`);
+    
+    // Validate the service is available
+    if (!telecelService || typeof telecelService.sendDataBundle !== 'function') {
+      console.error('[TELECEL PROCESSOR] TelecelService not properly initialized');
+      throw new Error('TelecelService not available');
+    }
     
     // Send data bundle via Telecel API
     const result = await telecelService.sendDataBundle(
       purchase.phoneNumber,
       purchase.capacity
     );
+
+    console.log(`[TELECEL PROCESSOR] Result:`, result);
 
     if (result.success) {
       // Update purchase status to completed
@@ -128,14 +139,17 @@ const processTelecelPurchase = async (purchase) => {
       
       // Create notification for user if exists
       if (purchase.userId) {
-        const Notification = require('../../Schema/Schema').Notification;
-        await Notification.create({
-          userId: purchase.userId,
-          title: 'Data Bundle Delivered',
-          message: `Your ${purchase.capacity}GB TELECEL data bundle has been successfully delivered to ${purchase.phoneNumber}`,
-          type: 'success',
-          category: 'purchase'
-        });
+        try {
+          await Notification.create({
+            userId: purchase.userId,
+            title: 'Data Bundle Delivered',
+            message: `Your ${purchase.capacity}GB TELECEL data bundle has been successfully delivered to ${purchase.phoneNumber}`,
+            type: 'success',
+            category: 'purchase'
+          });
+        } catch (notifError) {
+          console.error('[TELECEL PROCESSOR] Notification error:', notifError);
+        }
       }
 
       return true;
@@ -150,7 +164,7 @@ const processTelecelPurchase = async (purchase) => {
         purchase.adminNotes = 'TELECEL API token needs to be renewed';
       } else {
         purchase.status = 'failed';
-        purchase.failureReason = result.error;
+        purchase.failureReason = result.error || 'Unknown error';
       }
       
       await purchase.save();
@@ -168,28 +182,42 @@ const processTelecelPurchase = async (purchase) => {
 
 // ==================== PAYSTACK CONFIGURATION ====================
 const getPaystackConfig = async () => {
-  const settings = await SystemSettings.getSettings();
-  
-  if (!settings.paymentGateway?.paystack?.enabled) {
-    throw new Error('Paystack payment gateway is disabled');
+  try {
+    const settings = await SystemSettings.getSettings();
+    
+    if (!settings.paymentGateway?.paystack?.enabled) {
+      throw new Error('Paystack payment gateway is disabled');
+    }
+    
+    const secretKey = settings.paymentGateway.paystack.secretKey || process.env.PAYSTACK_SECRET_KEY;
+    const publicKey = settings.paymentGateway.paystack.publicKey || process.env.PAYSTACK_PUBLIC_KEY;
+    
+    if (!secretKey || !publicKey) {
+      throw new Error('Paystack keys not configured');
+    }
+    
+    return {
+      secretKey,
+      publicKey,
+      webhookUrl: settings.paymentGateway.paystack.webhookUrl,
+      transactionFee: settings.paymentGateway.paystack.transactionFee || 1.95,
+      capAt: settings.paymentGateway.paystack.capAt || 100,
+      splitPayment: settings.paymentGateway.paystack.splitPayment || false,
+      subaccountCode: settings.paymentGateway.paystack.subaccountCode
+    };
+  } catch (error) {
+    console.error('Paystack config error:', error);
+    // Return default config if settings fail
+    return {
+      secretKey: process.env.PAYSTACK_SECRET_KEY,
+      publicKey: process.env.PAYSTACK_PUBLIC_KEY,
+      webhookUrl: process.env.PAYSTACK_WEBHOOK_URL,
+      transactionFee: 1.95,
+      capAt: 100,
+      splitPayment: false,
+      subaccountCode: null
+    };
   }
-  
-  const secretKey = settings.paymentGateway.paystack.secretKey || process.env.PAYSTACK_SECRET_KEY;
-  const publicKey = settings.paymentGateway.paystack.publicKey || process.env.PAYSTACK_PUBLIC_KEY;
-  
-  if (!secretKey || !publicKey) {
-    throw new Error('Paystack keys not configured');
-  }
-  
-  return {
-    secretKey,
-    publicKey,
-    webhookUrl: settings.paymentGateway.paystack.webhookUrl,
-    transactionFee: settings.paymentGateway.paystack.transactionFee || 1.95,
-    capAt: settings.paymentGateway.paystack.capAt || 100,
-    splitPayment: settings.paymentGateway.paystack.splitPayment || false,
-    subaccountCode: settings.paymentGateway.paystack.subaccountCode
-  };
 };
 
 const getPaystackAPI = async () => {
@@ -352,6 +380,7 @@ const processWalletPayment = async (userId, amount, reference, purchase) => {
 
     // Process TELECEL purchases immediately
     if (purchase.network === 'TELECEL') {
+      console.log('[WALLET] Processing TELECEL purchase automatically');
       await processTelecelPurchase(purchase);
     }
 
@@ -523,7 +552,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
           network,
           capacity,
           phoneNumber,
-          status: 'processing',
+          status: purchase.status,
           newBalance: walletResult.newBalance
         }
       });
@@ -533,7 +562,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
         email: req.user.email,
         amount: userPrice * 100,
         reference,
-        currency: settings.platform?.currency || 'GHS',
+        currency: settings?.platform?.currency || 'GHS',
         metadata: {
           purchaseId: purchase._id,
           userId,
@@ -541,7 +570,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
           capacity,
           phoneNumber
         },
-        callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/store${reference}`,
+        callback_url: `${process.env.FRONTEND_URL || settings?.platform?.siteUrl}/verify/store/${reference}`,
         ...(paystackConfig.subaccountCode && {
           subaccount: paystackConfig.subaccountCode,
           bearer: 'account'
@@ -708,7 +737,7 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       email: customerEmail || req.user?.email || `guest_${Date.now()}@customer.com`,
       amount: Math.round(agentPrice * 100),
       reference,
-      currency: settings.platform?.currency || 'GHS',
+      currency: settings?.platform?.currency || 'GHS',
       metadata: {
         purchaseId: purchase._id.toString(),
         agentId: store.agent._id.toString(),
@@ -721,7 +750,7 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         isStorePurchase: true,
         customerName: customerName || 'Guest'
       },
-      callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/verify/store/${reference}?subdomain=${subdomain}`,
+      callback_url: `${process.env.FRONTEND_URL || settings?.platform?.siteUrl}/verify/store/${reference}?subdomain=${subdomain}`,
       channels: ['card', 'bank', 'mobile_money'],
       ...(paystackConfig.subaccountCode && {
         subaccount: paystackConfig.subaccountCode,
@@ -762,7 +791,7 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         accessCode: paystackResponse.data.data.access_code,
         publicKey: paystackConfig.publicKey,
         paymentInfo: {
-          currency: settings.platform?.currency || 'GHS',
+          currency: settings?.platform?.currency || 'GHS',
           email: paystackPayload.email,
           channels: paystackPayload.channels
         }
@@ -788,7 +817,7 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
   }
 });
 
-// 3. PAYSTACK WEBHOOK HANDLER - UPDATED WITH TELECEL PROCESSING
+// 3. PAYSTACK WEBHOOK HANDLER - WITH TELECEL PROCESSING
 router.post('/webhook/paystack', async (req, res) => {
   try {
     console.log('[WEBHOOK] Received Paystack webhook');
@@ -968,7 +997,7 @@ router.post('/webhook/paystack', async (req, res) => {
   }
 });
 
-// 4. Verify payment - UPDATED WITH TELECEL PROCESSING
+// 4. Verify payment - WITH TELECEL PROCESSING
 router.get('/verify/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
@@ -992,7 +1021,7 @@ router.get('/verify/:reference', async (req, res) => {
         message: 'Payment already verified',
         data: {
           reference,
-          status: 'processing',
+          status: purchases[0].status,
           amount: purchases.reduce((sum, p) => sum + p.price, 0)
         }
       });
@@ -1039,7 +1068,7 @@ router.get('/verify/:reference', async (req, res) => {
         message: 'Payment verified successfully',
         data: {
           reference,
-          status: 'processing',
+          status: purchases[0].status,
           amount: totalAmount,
           totalItems: purchases.length,
           purchases: purchases.map(p => ({

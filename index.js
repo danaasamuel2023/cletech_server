@@ -14,6 +14,7 @@ const UserDeposite = require('./routes/deposite/deposite.js')
 const wallet = require('./routes/user_walllet/page.js')
 const user_dashboard = require('./routes/user_dashboard/page.js')
 const checkers = require('./routes/result_checkers/page.js')
+const telecel_token = require('./routes/admin_telecel_auth/admin.js')
 // const Profits = require('./routes/profits.js')
 // const withdrawal = require('./withdrawal/withdrawal.js');
 dotenv.config(); 
@@ -41,6 +42,7 @@ app.use('/api/deposites', UserDeposite);
 app.use('/api/users', wallet);
 app.use('/api', user_dashboard);
 app.use('/api/checkers', checkers);
+app.use('/api/admin/telecel', telecel_token);
 // app.use('/api', Profits);
 // app.use('/api/admin-withdrawal', withdrawal);
 
