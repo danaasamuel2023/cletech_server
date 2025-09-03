@@ -1,5 +1,6 @@
 // ==================== telecelservice/telecel_service.js ====================
-const axios = require('axios'); // REQUIRED IMPORT
+// PRODUCTION VERSION - REAL API ONLY - NO SIMULATION
+const axios = require('axios');
 const TelecelAuthService = require('../routes/telecelauth/auth');
 const TelecelToken = require('../routes/telecel_Schema/schema');
 
@@ -13,7 +14,7 @@ class TelecelService {
   // Get token with automatic error handling
   async getAuthToken() {
     try {
-      // Try to get active token from TelecelAuthService
+      // Get active token from TelecelAuthService
       return await this.authService.getActiveToken();
     } catch (error) {
       console.error('[TELECEL] Token error:', error.message);
@@ -22,40 +23,44 @@ class TelecelService {
       try {
         const anyToken = await TelecelToken.findOne().sort({ createdAt: -1 });
         if (anyToken && anyToken.token) {
-          console.log('[TELECEL] Using last known token (may be expired)');
+          console.log('[TELECEL] WARNING: Using potentially expired token from database');
           return anyToken.token;
         }
       } catch (dbError) {
         console.error('[TELECEL] Database error:', dbError.message);
       }
       
-      // For development/testing, use mock token
-      if (process.env.NODE_ENV === 'development' || process.env.USE_MOCK_TELECEL === 'true') {
-        console.log('[TELECEL] Using mock token for development');
-        return 'mock_development_token';
-      }
-      
-      // In production, throw error to stop purchase
-      throw new Error('Authentication token expired. Please contact admin to refresh token.');
+      // No token available - throw error
+      throw new Error('Authentication token not available. Please contact admin to generate a new token.');
     }
   }
 
-  // Main method to send data bundle
+  // Main method to send data bundle - REAL API ONLY
   async sendDataBundle(phoneNumber, capacity) {
     try {
+      // Validate request first
+      const validation = this.validateRequest(phoneNumber, capacity);
+      if (!validation.valid) {
+        throw new Error(`Validation failed: ${validation.errors.join(', ')}`);
+      }
+
       // Get active token
       const authToken = await this.getAuthToken();
+      
+      if (!authToken) {
+        throw new Error('No authentication token available');
+      }
       
       const formattedPhone = this.formatPhoneNumber(phoneNumber);
       const bundlePlan = this.getBundlePlan(capacity);
       const transactionId = this.generateTransactionId();
 
-      console.log(`[TELECEL] Processing bundle request:`);
+      console.log(`[TELECEL] Processing REAL bundle request:`);
       console.log(`[TELECEL] - Phone: ${formattedPhone}`);
       console.log(`[TELECEL] - Capacity: ${capacity}GB`);
       console.log(`[TELECEL] - Plan: ${bundlePlan}`);
       console.log(`[TELECEL] - Transaction ID: ${transactionId}`);
-      console.log(`[TELECEL] - Token: ${authToken ? 'Present' : 'Missing'}`);
+      console.log(`[TELECEL] - Token Status: ${authToken ? 'Active' : 'Missing'}`);
 
       const requestData = {
         beneficiaryMsisdn: formattedPhone,
@@ -66,27 +71,8 @@ class TelecelService {
         beneficiaryName: formattedPhone
       };
 
-      // MOCK MODE CHECK - For development/testing
-      if (authToken === 'mock_development_token' || authToken.startsWith('mock_')) {
-        console.log('[TELECEL] Running in MOCK MODE - simulating successful delivery');
-        
-        // Simulate processing delay
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        return {
-          success: true,
-          transactionId: transactionId,
-          data: { 
-            mock: true,
-            status: 'success',
-            message: 'Mock delivery successful'
-          },
-          message: `[MOCK] Successfully sent ${capacity}GB to ${formattedPhone}`
-        };
-      }
-
-      // PRODUCTION API CALL
-      console.log('[TELECEL] Making API request to Telecel...');
+      // REAL API CALL TO TELECEL
+      console.log('[TELECEL] Making LIVE API request to Telecel...');
       
       const response = await axios.post(
         `${this.baseURL}/enterprise-request/api/data-sharer/prepaid/add-beneficiary`,
@@ -100,27 +86,31 @@ class TelecelService {
             'Origin': this.baseURL,
             'Referer': `${this.baseURL}/enterprise-request/app/bundle-sharer/beneficiaries/`
           },
-          timeout: 30000 // 30 seconds timeout
+          timeout: 30000, // 30 seconds timeout
+          validateStatus: function (status) {
+            return status >= 200 && status < 500; // Don't throw on 4xx errors
+          }
         }
       );
 
-      console.log('[TELECEL] API Response received:', response.status);
-      console.log('[TELECEL] Bundle sent successfully');
+      // Check response status
+      if (response.status === 200 || response.status === 201) {
+        console.log('[TELECEL] ✅ Bundle sent successfully');
+        console.log('[TELECEL] API Response:', JSON.stringify(response.data));
 
-      return {
-        success: true,
-        transactionId: transactionId,
-        data: response.data,
-        message: `Successfully sent ${capacity}GB to ${formattedPhone}`,
-        apiResponse: response.data
-      };
+        return {
+          success: true,
+          transactionId: transactionId,
+          data: response.data,
+          message: `Successfully sent ${capacity}GB to ${formattedPhone}`,
+          apiResponse: response.data,
+          statusCode: response.status
+        };
+      }
 
-    } catch (error) {
-      console.error('[TELECEL] Error sending bundle:', error.message);
-      
-      // Handle 401 Unauthorized - Token expired
-      if (error.response?.status === 401) {
-        console.error('[TELECEL] 401 Unauthorized - Token expired');
+      // Handle specific error responses
+      if (response.status === 401) {
+        console.error('[TELECEL] ❌ 401 Unauthorized - Token expired or invalid');
         
         // Mark token as expired in database
         try {
@@ -129,7 +119,7 @@ class TelecelService {
             { 
               $set: { 
                 isActive: false,
-                'lastError.message': 'Token expired - 401 response',
+                'lastError.message': 'Token expired - 401 Unauthorized',
                 'lastError.occurredAt': new Date()
               }
             }
@@ -141,26 +131,47 @@ class TelecelService {
 
         return {
           success: false,
-          error: 'Authentication failed - token expired. Admin has been notified.',
+          error: 'Authentication failed - token expired. Admin needs to refresh the token.',
           requiresNewToken: true,
           statusCode: 401
         };
       }
 
-      // Handle 400 Bad Request - Insufficient balance or invalid request
-      if (error.response?.status === 400) {
-        console.error('[TELECEL] 400 Bad Request:', error.response.data);
+      if (response.status === 400) {
+        console.error('[TELECEL] ❌ 400 Bad Request:', response.data);
         return {
           success: false,
-          error: 'Insufficient balance or invalid request',
-          details: error.response.data,
+          error: response.data?.message || 'Invalid request or insufficient balance',
+          details: response.data,
           statusCode: 400
         };
       }
 
+      if (response.status === 403) {
+        console.error('[TELECEL] ❌ 403 Forbidden:', response.data);
+        return {
+          success: false,
+          error: 'Access forbidden - check account permissions',
+          details: response.data,
+          statusCode: 403
+        };
+      }
+
+      // Any other non-success status
+      console.error(`[TELECEL] ❌ Unexpected status ${response.status}:`, response.data);
+      return {
+        success: false,
+        error: `Request failed with status ${response.status}`,
+        details: response.data,
+        statusCode: response.status
+      };
+
+    } catch (error) {
+      console.error('[TELECEL] ❌ Critical error:', error.message);
+      
       // Handle timeout
       if (error.code === 'ECONNABORTED') {
-        console.error('[TELECEL] Request timeout');
+        console.error('[TELECEL] Request timeout after 30 seconds');
         return {
           success: false,
           error: 'Request timeout - Telecel API is not responding',
@@ -169,12 +180,40 @@ class TelecelService {
       }
 
       // Handle network errors
-      if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED') {
-        console.error('[TELECEL] Network error:', error.code);
+      if (error.code === 'ENOTFOUND') {
+        console.error('[TELECEL] Network error - cannot find host');
         return {
           success: false,
-          error: 'Cannot connect to Telecel API - Network error',
+          error: 'Cannot reach Telecel API - DNS resolution failed',
           statusCode: 503
+        };
+      }
+
+      if (error.code === 'ECONNREFUSED') {
+        console.error('[TELECEL] Connection refused by Telecel API');
+        return {
+          success: false,
+          error: 'Connection refused by Telecel API',
+          statusCode: 503
+        };
+      }
+
+      // Handle validation errors
+      if (error.message.includes('Validation failed')) {
+        return {
+          success: false,
+          error: error.message,
+          statusCode: 400
+        };
+      }
+
+      // Handle token errors
+      if (error.message.includes('token')) {
+        return {
+          success: false,
+          error: error.message,
+          requiresNewToken: true,
+          statusCode: 401
         };
       }
 
@@ -211,7 +250,7 @@ class TelecelService {
     
     // Validate format
     if (!/^0[2-9]\d{8}$/.test(cleaned)) {
-      console.warn(`[TELECEL] Invalid phone number format: ${phoneNumber} -> ${cleaned}`);
+      throw new Error(`Invalid phone number format: ${phoneNumber}`);
     }
     
     return cleaned;
@@ -219,22 +258,17 @@ class TelecelService {
 
   // Get bundle plan name based on capacity
   getBundlePlan(capacity) {
-    // For now, always return 5500GB plan
-    // In future, this could map different capacities to different plans
-    return 'Bundle Sharer 5500GB';
-    
-    /* Future implementation example:
     const capacityNum = parseFloat(capacity);
-    if (capacityNum <= 10) return 'Bundle Sharer 100GB';
-    if (capacityNum <= 100) return 'Bundle Sharer 1000GB';
-    return 'Bundle Sharer 5500GB';
-    */
-  }
-
-  // Check if service is in mock mode
-  isMockMode() {
-    return process.env.NODE_ENV === 'development' || 
-           process.env.USE_MOCK_TELECEL === 'true';
+    
+    // Map capacity to appropriate plan
+    // You may need to adjust these based on actual Telecel plans
+    if (capacityNum <= 100) {
+      return 'Bundle Sharer 100GB';
+    } else if (capacityNum <= 1000) {
+      return 'Bundle Sharer 1000GB';
+    } else {
+      return 'Bundle Sharer 5500GB';
+    }
   }
 
   // Validate request before sending
@@ -242,15 +276,28 @@ class TelecelService {
     const errors = [];
     
     // Validate phone number
-    const cleaned = phoneNumber.replace(/\D/g, '');
-    if (!cleaned || cleaned.length < 9) {
-      errors.push('Invalid phone number');
+    try {
+      const cleaned = phoneNumber.replace(/\D/g, '');
+      if (!cleaned || cleaned.length < 9) {
+        errors.push('Invalid phone number - too short');
+      }
+      
+      // Format and validate
+      const formatted = this.formatPhoneNumber(phoneNumber);
+      if (!/^0[2-9]\d{8}$/.test(formatted)) {
+        errors.push('Invalid Ghana phone number format');
+      }
+    } catch (error) {
+      errors.push(error.message);
     }
     
     // Validate capacity
     const capacityNum = parseFloat(capacity);
-    if (isNaN(capacityNum) || capacityNum <= 0 || capacityNum > 5500) {
-      errors.push('Invalid capacity (must be between 0.1 and 5500 GB)');
+    if (isNaN(capacityNum) || capacityNum <= 0) {
+      errors.push('Invalid capacity - must be greater than 0');
+    }
+    if (capacityNum > 5500) {
+      errors.push('Capacity exceeds maximum limit of 5500 GB');
     }
     
     return {
@@ -259,34 +306,73 @@ class TelecelService {
     };
   }
 
-  // Get service status
+  // Get service status - REAL STATUS ONLY
   async getServiceStatus() {
     try {
       const tokenStatus = await this.authService.checkTokenStatus();
       
+      // Check if we can reach the API
+      let apiReachable = false;
+      try {
+        await axios.get(`${this.baseURL}/enterprise-request/`, {
+          timeout: 5000
+        });
+        apiReachable = true;
+      } catch (error) {
+        apiReachable = false;
+      }
+      
       return {
         service: 'TELECEL',
-        status: tokenStatus.status === 'active' ? 'operational' : 'degraded',
-        mockMode: this.isMockMode(),
-        tokenStatus: tokenStatus,
+        mode: 'PRODUCTION',
+        status: tokenStatus.status === 'active' && apiReachable ? 'operational' : 'degraded',
+        apiReachable: apiReachable,
+        tokenStatus: {
+          active: tokenStatus.status === 'active',
+          expiresIn: tokenStatus.expiresIn,
+          message: tokenStatus.status === 'active' 
+            ? 'Token is active' 
+            : 'Token expired or missing - admin action required'
+        },
         subscriberMsisdn: this.subscriberMsisdn,
-        baseURL: this.baseURL
+        baseURL: this.baseURL,
+        timestamp: new Date().toISOString()
       };
     } catch (error) {
       return {
         service: 'TELECEL',
+        mode: 'PRODUCTION',
         status: 'error',
-        mockMode: this.isMockMode(),
-        error: error.message
+        error: error.message,
+        message: 'Service status check failed - possible configuration issue',
+        timestamp: new Date().toISOString()
       };
     }
   }
+
+  // Check if bundle delivery is possible
+  async canDeliverBundle() {
+    try {
+      const status = await this.getServiceStatus();
+      return status.status === 'operational';
+    } catch (error) {
+      return false;
+    }
+  }
+
+  // Get detailed error information for logging
+  getErrorDetails(error) {
+    return {
+      message: error.message,
+      code: error.code,
+      statusCode: error.response?.status,
+      statusText: error.response?.statusText,
+      data: error.response?.data,
+      headers: error.response?.headers,
+      timestamp: new Date().toISOString()
+    };
+  }
 }
 
-// REQUIRED EXPORT - Export the class
+// Export the class
 module.exports = TelecelService;
-
-/* Alternative singleton pattern (if preferred):
-const telecelService = new TelecelService();
-module.exports = telecelService;
-*/
