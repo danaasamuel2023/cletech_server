@@ -1,5 +1,5 @@
 // ==================== routes/Datapurchase/order.js ====================
-// Complete Purchase Routes with Fixed Telecel Integration
+// COMPLETE SAFE PURCHASE ROUTES - NO MONEY DEDUCTED ON ERRORS
 
 const express = require('express');
 const router = express.Router();
@@ -9,11 +9,12 @@ const crypto = require('crypto');
 const cron = require('node-cron');
 const multer = require('multer');
 const XLSX = require('xlsx');
+const mongoose = require('mongoose');
 const { adminOnly, asyncHandler, validate } = require('../../middleware/middleware');
 
-// FIXED: Import TelecelService class and create instance
+// Import TelecelService class and create instance
 const TelecelService = require('../../telecelservice/telecel_service');
-const telecelService = new TelecelService(); // Create instance here
+const telecelService = new TelecelService();
 
 const { 
   DataPurchase, 
@@ -103,80 +104,210 @@ const upload = multer({
   }
 });
 
-// ==================== TELECEL PROCESSING FUNCTION ====================
-const processTelecelPurchase = async (purchase) => {
+// ==================== SAFE DELIVERY PROCESSING ====================
+
+// Attempt delivery for any network
+const attemptDelivery = async (purchase) => {
   try {
-    console.log(`[TELECEL PROCESSOR] Processing purchase ${purchase.reference}`);
-    console.log(`[TELECEL PROCESSOR] Network: ${purchase.network}, Capacity: ${purchase.capacity}GB`);
+    let result = { success: false, error: 'Network not supported' };
     
-    // Validate the service is available
-    if (!telecelService || typeof telecelService.sendDataBundle !== 'function') {
-      console.error('[TELECEL PROCESSOR] TelecelService not properly initialized');
-      throw new Error('TelecelService not available');
+    switch (purchase.network) {
+      case 'TELECEL':
+        console.log(`[DELIVERY] Attempting TELECEL delivery for ${purchase.reference}`);
+        result = await telecelService.sendDataBundle(
+          purchase.phoneNumber,
+          purchase.capacity
+        );
+        break;
+        
+      case 'MTN':
+      case 'YELLO':
+        // Add MTN delivery logic here when available
+        console.log(`[DELIVERY] MTN/YELLO delivery not yet implemented for ${purchase.reference}`);
+        result = { 
+          success: false, 
+          error: 'MTN delivery service not yet available',
+          requiresManual: true 
+        };
+        break;
+        
+      case 'AT':
+      case 'AT_PREMIUM':
+      case 'AIRTELTIGO':
+        // Add AirtelTigo delivery logic here when available
+        console.log(`[DELIVERY] AirtelTigo delivery not yet implemented for ${purchase.reference}`);
+        result = { 
+          success: false, 
+          error: 'AirtelTigo delivery service not yet available',
+          requiresManual: true 
+        };
+        break;
+        
+      default:
+        result = { 
+          success: false, 
+          error: `Unknown network: ${purchase.network}` 
+        };
     }
     
-    // Send data bundle via Telecel API
-    const result = await telecelService.sendDataBundle(
-      purchase.phoneNumber,
-      purchase.capacity
-    );
+    return result;
+  } catch (error) {
+    console.error(`[DELIVERY] Error attempting delivery:`, error);
+    return { 
+      success: false, 
+      error: error.message || 'Delivery attempt failed' 
+    };
+  }
+};
 
-    console.log(`[TELECEL PROCESSOR] Result:`, result);
+// ==================== SAFE WALLET PAYMENT PROCESSING ====================
 
-    if (result.success) {
-      // Update purchase status to completed
+const processWalletPaymentSafe = async (userId, amount, reference, purchase) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    // Step 1: Verify user and balance WITHOUT modifying anything
+    const user = await User.findById(userId).session(session);
+    
+    if (!user) {
+      await session.abortTransaction();
+      throw new Error('User not found');
+    }
+    
+    if (user.walletBalance < amount) {
+      await session.abortTransaction();
+      throw new Error(`Insufficient wallet balance. Required: ₵${amount}, Available: ₵${user.walletBalance}`);
+    }
+    
+    console.log(`[SAFE-WALLET] Pre-check passed - Balance: ₵${user.walletBalance}, Required: ₵${amount}`);
+    
+    // Step 2: Attempt delivery FIRST (before touching money)
+    const deliveryResult = await attemptDelivery(purchase);
+    
+    // Step 3: Handle result based on delivery outcome
+    if (deliveryResult.success) {
+      // Delivery successful - NOW and ONLY NOW deduct money
+      console.log('[SAFE-WALLET] Delivery successful, deducting money...');
+      
+      const previousBalance = user.walletBalance;
+      user.walletBalance -= amount;
+      await user.save({ session });
+      
+      // Create transaction record
+      await Transaction.create([{
+        userId,
+        type: 'purchase',
+        amount,
+        balanceBefore: previousBalance,
+        balanceAfter: user.walletBalance,
+        reference,
+        gateway: 'wallet',
+        status: 'completed',
+        relatedPurchaseId: purchase._id,
+        description: `Data purchase: ${purchase.capacity}GB ${purchase.network}`
+      }], { session });
+      
+      // Update purchase status
       purchase.status = 'completed';
       purchase.deliveredAt = new Date();
-      purchase.deliveryDetails = {
-        provider: 'TELECEL',
-        transactionId: result.transactionId,
-        message: result.message,
-        processedAt: new Date()
-      };
-      await purchase.save();
-
-      console.log(`[TELECEL PROCESSOR] Successfully delivered ${purchase.capacity}GB to ${purchase.phoneNumber}`);
+      purchase.deliveryDetails = deliveryResult;
+      await purchase.save({ session });
       
-      // Create notification for user if exists
+      await session.commitTransaction();
+      
+      // Send success notification
       if (purchase.userId) {
-        try {
-          await Notification.create({
-            userId: purchase.userId,
-            title: 'Data Bundle Delivered',
-            message: `Your ${purchase.capacity}GB TELECEL data bundle has been successfully delivered to ${purchase.phoneNumber}`,
-            type: 'success',
-            category: 'purchase'
-          });
-        } catch (notifError) {
-          console.error('[TELECEL PROCESSOR] Notification error:', notifError);
-        }
+        await Notification.create({
+          userId: purchase.userId,
+          title: 'Data Bundle Delivered',
+          message: `Your ${purchase.capacity}GB ${purchase.network} data has been delivered to ${purchase.phoneNumber}`,
+          type: 'success',
+          category: 'purchase'
+        });
       }
-
-      return true;
+      
+      console.log(`[SAFE-WALLET] Transaction complete - ₵${amount} deducted, new balance: ₵${user.walletBalance}`);
+      
+      return { 
+        success: true, 
+        newBalance: user.walletBalance,
+        delivered: true,
+        status: 'completed'
+      };
+      
+    } else if (deliveryResult.requiresManual) {
+      // Network not automated yet - deduct money but mark for manual processing
+      console.log('[SAFE-WALLET] Network requires manual processing, deducting money...');
+      
+      const previousBalance = user.walletBalance;
+      user.walletBalance -= amount;
+      await user.save({ session });
+      
+      await Transaction.create([{
+        userId,
+        type: 'purchase',
+        amount,
+        balanceBefore: previousBalance,
+        balanceAfter: user.walletBalance,
+        reference,
+        gateway: 'wallet',
+        status: 'completed',
+        relatedPurchaseId: purchase._id,
+        description: `Data purchase (manual processing): ${purchase.capacity}GB ${purchase.network}`
+      }], { session });
+      
+      purchase.status = 'processing';
+      purchase.adminNotes = 'Requires manual processing';
+      await purchase.save({ session });
+      
+      await session.commitTransaction();
+      
+      // Send notification about manual processing
+      if (purchase.userId) {
+        await Notification.create({
+          userId: purchase.userId,
+          title: 'Purchase Processing',
+          message: `Your ${purchase.capacity}GB ${purchase.network} purchase is being processed. You will be notified once delivered.`,
+          type: 'info',
+          category: 'purchase'
+        });
+      }
+      
+      return { 
+        success: true, 
+        newBalance: user.walletBalance,
+        delivered: false,
+        status: 'processing'
+      };
+      
     } else {
-      // Handle failure
-      console.error(`[TELECEL PROCESSOR] Failed to deliver: ${result.error}`);
+      // Delivery failed - DO NOT charge customer
+      await session.abortTransaction();
       
-      // If token expired, mark for manual processing
-      if (result.requiresNewToken) {
-        purchase.status = 'failed';
-        purchase.failureReason = 'Authentication token expired - requires manual update';
-        purchase.adminNotes = 'TELECEL API token needs to be renewed';
-      } else {
-        purchase.status = 'failed';
-        purchase.failureReason = result.error || 'Unknown error';
-      }
-      
+      purchase.status = 'failed';
+      purchase.failureReason = deliveryResult.error;
       await purchase.save();
       
-      return false;
+      console.log(`[SAFE-WALLET] Delivery failed: ${deliveryResult.error} - NO money deducted`);
+      
+      throw new Error(`Delivery failed: ${deliveryResult.error}. Your wallet was NOT charged.`);
     }
+    
   } catch (error) {
-    console.error('[TELECEL PROCESSOR] Error:', error);
-    purchase.status = 'failed';
-    purchase.failureReason = error.message;
-    await purchase.save();
-    return false;
+    await session.abortTransaction();
+    console.error('[SAFE-WALLET] Transaction aborted:', error.message);
+    
+    // Ensure purchase is marked as failed
+    if (purchase.status === 'pending') {
+      purchase.status = 'failed';
+      purchase.failureReason = error.message;
+      await purchase.save();
+    }
+    
+    throw error;
+  } finally {
+    session.endSession();
   }
 };
 
@@ -207,7 +338,6 @@ const getPaystackConfig = async () => {
     };
   } catch (error) {
     console.error('Paystack config error:', error);
-    // Return default config if settings fail
     return {
       secretKey: process.env.PAYSTACK_SECRET_KEY,
       publicKey: process.env.PAYSTACK_PUBLIC_KEY,
@@ -351,49 +481,10 @@ const checkStockAvailability = async (network, capacity, method = 'web') => {
   }
 };
 
-const processWalletPayment = async (userId, amount, reference, purchase) => {
-  try {
-    const user = await User.findById(userId);
-    
-    if (user.walletBalance < amount) {
-      throw new Error('Insufficient wallet balance');
-    }
-
-    user.walletBalance -= amount;
-    await user.save();
-
-    await Transaction.create({
-      userId,
-      type: 'purchase',
-      amount,
-      balanceBefore: user.walletBalance + amount,
-      balanceAfter: user.walletBalance,
-      reference,
-      gateway: 'wallet',
-      status: 'completed',
-      relatedPurchaseId: purchase._id,
-      description: `Data purchase: ${purchase.capacity}GB ${purchase.network}`
-    });
-
-    purchase.status = 'processing';
-    await purchase.save();
-
-    // Process TELECEL purchases immediately
-    if (purchase.network === 'TELECEL') {
-      console.log('[WALLET] Processing TELECEL purchase automatically');
-      await processTelecelPurchase(purchase);
-    }
-
-    return { success: true, newBalance: user.walletBalance };
-  } catch (error) {
-    throw error;
-  }
-};
-
 const updateStoreStatistics = async (purchase) => {
   try {
     if (purchase.method === 'agent_store' && purchase.agentId) {
-      console.log(`[WEBHOOK] Updating store stats for agent: ${purchase.agentId}`);
+      console.log(`[STORE] Updating stats for agent: ${purchase.agentId}`);
       
       const agent = await User.findById(purchase.agentId);
       if (agent) {
@@ -401,7 +492,7 @@ const updateStoreStatistics = async (purchase) => {
         agent.agentProfit = (agent.agentProfit || 0) + profitAmount;
         agent.totalEarnings = (agent.totalEarnings || 0) + profitAmount;
         await agent.save();
-        console.log(`[WEBHOOK] Updated agent profit: +${profitAmount} GHS`);
+        console.log(`[STORE] Updated agent profit: +${profitAmount} GHS`);
       }
 
       await AgentProfit.findOneAndUpdate(
@@ -420,10 +511,7 @@ const updateStoreStatistics = async (purchase) => {
             'statistics.totalOrders': 1,
             'statistics.totalRevenue': purchase.price,
             'statistics.totalProfit': purchase.pricing.agentProfit || 0,
-            'statistics.totalCustomers': 1,
-            'statistics.todayProfit': purchase.pricing.agentProfit || 0,
-            'statistics.weekProfit': purchase.pricing.agentProfit || 0,
-            'statistics.monthProfit': purchase.pricing.agentProfit || 0
+            'statistics.totalCustomers': 1
           },
           $set: {
             'statistics.lastSaleDate': new Date()
@@ -432,12 +520,12 @@ const updateStoreStatistics = async (purchase) => {
         { new: true }
       );
       
-      console.log(`[WEBHOOK] Store stats updated for: ${storeUpdate?.storeName}`);
+      console.log(`[STORE] Stats updated for: ${storeUpdate?.storeName}`);
       return true;
     }
     return false;
   } catch (error) {
-    console.error('[WEBHOOK] Error updating store stats:', error);
+    console.error('[STORE] Error updating stats:', error);
     return false;
   }
 };
@@ -446,12 +534,10 @@ const deleteAbandonedOrders = async () => {
   try {
     const cutoffTime = new Date(Date.now() - 5 * 60 * 1000); // 5 minutes ago
     
-    console.log(`[CLEANUP] Running cleanup at ${new Date().toISOString()}`);
-    
     const abandonedOrders = await DataPurchase.find({
       status: 'pending',
       createdAt: { $lt: cutoffTime }
-    }).select('_id reference agentId');
+    }).select('_id reference');
 
     if (abandonedOrders.length === 0) {
       return 0;
@@ -461,25 +547,23 @@ const deleteAbandonedOrders = async () => {
 
     const orderIds = abandonedOrders.map(order => order._id);
 
-    const deletedProfits = await AgentProfit.deleteMany({
+    await AgentProfit.deleteMany({
       purchaseId: { $in: orderIds },
       status: 'pending'
     });
-    console.log(`[CLEANUP] Deleted ${deletedProfits.deletedCount} pending profit records`);
 
     const deletedOrders = await DataPurchase.deleteMany({
       _id: { $in: orderIds }
     });
-    console.log(`[CLEANUP] Deleted ${deletedOrders.deletedCount} abandoned orders`);
 
     return deletedOrders.deletedCount;
   } catch (error) {
-    console.error('[CLEANUP ERROR]', error);
+    console.error('[CLEANUP] Error:', error);
     return 0;
   }
 };
 
-// Schedule cleanup to run every 2 minutes
+// Schedule cleanup
 cron.schedule('*/2 * * * *', async () => {
   await deleteAbandonedOrders();
 });
@@ -491,7 +575,7 @@ deleteAbandonedOrders().then(count => {
 
 // ==================== MAIN PURCHASE ROUTES ====================
 
-// 1. Purchase data (authenticated users)
+// 1. Purchase data with SAFE wallet handling
 router.post('/buy', protect, validatePurchase, checkValidation, async (req, res) => {
   try {
     const { phoneNumber, network, capacity, gateway } = req.body;
@@ -500,6 +584,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
     const settings = await SystemSettings.getSettings();
     const paystackConfig = await getPaystackConfig();
 
+    // Check stock
     const stockCheck = await checkStockAvailability(network, capacity, 'web');
     if (!stockCheck.available) {
       return res.status(400).json({
@@ -510,6 +595,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
 
     const userPrice = getUserPrice(stockCheck.pricing, req.user.role);
 
+    // Early balance check for wallet
     if (gateway === 'wallet') {
       if (req.user.walletBalance < userPrice) {
         return res.status(400).json({
@@ -523,6 +609,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
 
     const reference = generateReference('PURCHASE');
 
+    // Create purchase record (NOT charged yet)
     const purchase = await DataPurchase.create({
       userId,
       phoneNumber,
@@ -537,26 +624,53 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
         agentProfit: 0
       },
       reference,
-      status: gateway === 'wallet' ? 'processing' : 'pending'
+      status: 'pending' // Always start as pending
     });
 
     if (gateway === 'wallet') {
-      const walletResult = await processWalletPayment(userId, userPrice, reference, purchase);
+      try {
+        // Use SAFE wallet payment
+        const walletResult = await processWalletPaymentSafe(
+          userId, 
+          userPrice, 
+          reference, 
+          purchase
+        );
+        
+        res.json({
+          success: true,
+          message: walletResult.delivered 
+            ? 'Purchase successful and delivered' 
+            : 'Purchase successful - processing delivery',
+          data: {
+            reference: purchase.reference,
+            amount: userPrice,
+            network,
+            capacity,
+            phoneNumber,
+            status: walletResult.status,
+            newBalance: walletResult.newBalance,
+            delivered: walletResult.delivered
+          }
+        });
+        
+      } catch (walletError) {
+        // Wallet payment failed - no money was taken
+        console.error('[BUY] Wallet payment failed:', walletError.message);
+        
+        return res.status(400).json({
+          success: false,
+          message: walletError.message,
+          data: {
+            reference: purchase.reference,
+            walletCharged: false,
+            currentBalance: req.user.walletBalance
+          }
+        });
+      }
       
-      res.json({
-        success: true,
-        message: 'Purchase successful',
-        data: {
-          reference: purchase.reference,
-          amount: userPrice,
-          network,
-          capacity,
-          phoneNumber,
-          status: purchase.status,
-          newBalance: walletResult.newBalance
-        }
-      });
     } else {
+      // Paystack payment
       const paystackAPI = await getPaystackAPI();
       const paystackResponse = await paystackAPI.post('/transaction/initialize', {
         email: req.user.email,
@@ -611,14 +725,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
     const { subdomain } = req.params;
     const { phoneNumber, network, capacity, customerEmail, customerName } = req.body;
 
-    console.log('Store purchase request:', { 
-      subdomain, 
-      network, 
-      capacity, 
-      phoneNumber,
-      timestamp: new Date().toISOString() 
-    });
-
     const settings = await SystemSettings.getSettings();
     const paystackConfig = await getPaystackConfig();
 
@@ -668,13 +774,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
     const agentPrice = customPricing.agentPrice;
     const agentProfit = agentPrice - systemPrice;
 
-    console.log('Pricing calculated:', {
-      systemPrice,
-      agentPrice,
-      agentProfit,
-      profitMargin: ((agentProfit / systemPrice) * 100).toFixed(2) + '%'
-    });
-
     const reference = generateReference('STORE');
 
     const purchase = await DataPurchase.create({
@@ -706,12 +805,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       }
     });
 
-    console.log('Purchase record created:', {
-      id: purchase._id,
-      reference: purchase.reference,
-      status: purchase.status
-    });
-
     const agentProfitRecord = await AgentProfit.create({
       agentId: store.agent._id,
       purchaseId: purchase._id,
@@ -725,14 +818,6 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       status: 'pending'
     });
 
-    console.log('Agent profit record created (pending):', {
-      id: agentProfitRecord._id,
-      profit: agentProfit,
-      status: 'pending'
-    });
-
-    console.log('Initializing Paystack payment...');
-    
     const paystackPayload = {
       email: customerEmail || req.user?.email || `guest_${Date.now()}@customer.com`,
       amount: Math.round(agentPrice * 100),
@@ -765,15 +850,11 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
       await DataPurchase.findByIdAndDelete(purchase._id);
       await AgentProfit.findByIdAndDelete(agentProfitRecord._id);
       
-      console.error('Paystack initialization failed:', paystackResponse.data);
-      
       return res.status(500).json({
         success: false,
         message: 'Payment initialization failed. Please try again.'
       });
     }
-
-    console.log('Paystack payment initialized successfully');
 
     res.json({
       success: true,
@@ -789,35 +870,21 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         status: 'pending',
         paymentUrl: paystackResponse.data.data.authorization_url,
         accessCode: paystackResponse.data.data.access_code,
-        publicKey: paystackConfig.publicKey,
-        paymentInfo: {
-          currency: settings?.platform?.currency || 'GHS',
-          email: paystackPayload.email,
-          channels: paystackPayload.channels
-        }
+        publicKey: paystackConfig.publicKey
       }
     });
 
   } catch (error) {
     console.error('Store purchase error:', error);
-    
-    let errorMessage = 'Purchase failed. Please try again.';
-    
-    if (error.response?.data?.message) {
-      errorMessage = error.response.data.message;
-    } else if (error.message.includes('PAYSTACK')) {
-      errorMessage = 'Payment service temporarily unavailable. Please try again later.';
-    }
-
     res.status(500).json({
       success: false,
-      message: errorMessage,
+      message: 'Purchase failed',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
 
-// 3. PAYSTACK WEBHOOK HANDLER - WITH TELECEL PROCESSING
+// 3. PAYSTACK WEBHOOK HANDLER
 router.post('/webhook/paystack', async (req, res) => {
   try {
     console.log('[WEBHOOK] Received Paystack webhook');
@@ -836,15 +903,11 @@ router.post('/webhook/paystack', async (req, res) => {
     }
 
     const event = req.body;
-    console.log(`[WEBHOOK] Event type: ${event.event}`);
-    console.log(`[WEBHOOK] Reference: ${event.data?.reference}`);
 
     switch (event.event) {
       case 'charge.success':
         const successData = event.data;
         const successReference = successData.reference;
-        
-        console.log(`[WEBHOOK] Processing successful payment: ${successReference}`);
         
         const purchase = await DataPurchase.findOne({ reference: successReference });
         
@@ -858,8 +921,7 @@ router.post('/webhook/paystack', async (req, res) => {
           return res.status(200).send('Already processed');
         }
 
-        // Update purchase to PROCESSING
-        purchase.status = 'processing';
+        // Update purchase payment details
         purchase.paystackReference = successData.reference;
         purchase.verifiedAt = new Date();
         purchase.paymentDetails = {
@@ -870,17 +932,25 @@ router.post('/webhook/paystack', async (req, res) => {
           fees: successData.fees ? successData.fees / 100 : 0,
           customerEmail: successData.customer.email
         };
+
+        // Attempt delivery
+        const deliveryResult = await attemptDelivery(purchase);
+        
+        if (deliveryResult.success) {
+          purchase.status = 'completed';
+          purchase.deliveredAt = new Date();
+          purchase.deliveryDetails = deliveryResult;
+        } else if (deliveryResult.requiresManual) {
+          purchase.status = 'processing';
+          purchase.adminNotes = 'Requires manual processing';
+        } else {
+          purchase.status = 'failed';
+          purchase.failureReason = deliveryResult.error;
+        }
+        
         await purchase.save();
 
-        console.log(`[WEBHOOK] Purchase updated to processing: ${successReference}`);
-
-        // Process TELECEL purchases automatically
-        if (purchase.network === 'TELECEL') {
-          console.log(`[WEBHOOK] Processing TELECEL purchase automatically`);
-          await processTelecelPurchase(purchase);
-        }
-
-        // Update store statistics if it's a store purchase
+        // Update store statistics if applicable
         if (purchase.method === 'agent_store') {
           await updateStoreStatistics(purchase);
         }
@@ -894,23 +964,15 @@ router.post('/webhook/paystack', async (req, res) => {
           gateway: 'paystack',
           status: 'completed',
           relatedPurchaseId: purchase._id,
-          description: `Data purchase: ${purchase.capacity}GB ${purchase.network}`,
-          webhookData: {
-            eventType: event.event,
-            paystackReference: successData.reference,
-            processedAt: new Date()
-          }
+          description: `Data purchase: ${purchase.capacity}GB ${purchase.network}`
         });
 
-        console.log(`[WEBHOOK] Transaction created for: ${successReference}`);
         res.status(200).send('OK');
         break;
 
       case 'charge.failed':
         const failedData = event.data;
         const failedReference = failedData.reference;
-        
-        console.log(`[WEBHOOK] Processing failed payment: ${failedReference}`);
         
         await DataPurchase.findOneAndUpdate(
           { reference: failedReference },
@@ -932,15 +994,12 @@ router.post('/webhook/paystack', async (req, res) => {
           );
         }
 
-        console.log(`[WEBHOOK] Purchase marked as failed: ${failedReference}`);
         res.status(200).send('OK');
         break;
 
       case 'refund.processed':
         const refundData = event.data;
         const refundReference = refundData.transaction_reference;
-        
-        console.log(`[WEBHOOK] Processing refund: ${refundReference}`);
         
         const refundPurchase = await DataPurchase.findOne({ reference: refundReference });
         
@@ -979,25 +1038,22 @@ router.post('/webhook/paystack', async (req, res) => {
               }
             );
           }
-
-          console.log(`[WEBHOOK] Refund processed for: ${refundReference}`);
         }
         
         res.status(200).send('OK');
         break;
 
       default:
-        console.log(`[WEBHOOK] Unhandled event: ${event.event}`);
         res.status(200).send('OK');
     }
 
   } catch (error) {
-    console.error('[WEBHOOK ERROR]', error);
+    console.error('[WEBHOOK] Error:', error);
     res.status(500).send('Webhook processing failed');
   }
 });
 
-// 4. Verify payment - WITH TELECEL PROCESSING
+// 4. Verify payment
 router.get('/verify/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
@@ -1034,15 +1090,24 @@ router.get('/verify/:reference', async (req, res) => {
 
     if (paymentData.status === 'success') {
       for (const purchase of purchases) {
-        purchase.status = 'processing';
         purchase.paystackReference = paymentData.reference;
-        await purchase.save();
-
-        // Process TELECEL purchases automatically
-        if (purchase.network === 'TELECEL') {
-          console.log(`[VERIFY] Processing TELECEL purchase automatically`);
-          await processTelecelPurchase(purchase);
+        
+        // Attempt delivery
+        const deliveryResult = await attemptDelivery(purchase);
+        
+        if (deliveryResult.success) {
+          purchase.status = 'completed';
+          purchase.deliveredAt = new Date();
+          purchase.deliveryDetails = deliveryResult;
+        } else if (deliveryResult.requiresManual) {
+          purchase.status = 'processing';
+          purchase.adminNotes = 'Requires manual processing';
+        } else {
+          purchase.status = 'failed';
+          purchase.failureReason = deliveryResult.error;
         }
+        
+        await purchase.save();
 
         if (purchase.method === 'agent_store') {
           await updateStoreStatistics(purchase);
@@ -1094,7 +1159,7 @@ router.get('/verify/:reference', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('Payment verification error:', error);
+    console.error('Verification error:', error);
     res.status(500).json({
       success: false,
       message: 'Verification failed',
@@ -1103,7 +1168,7 @@ router.get('/verify/:reference', async (req, res) => {
   }
 });
 
-// 5. Get purchase history (excluding pending)
+// 5. Get purchase history
 router.get('/history', protect, async (req, res) => {
   try {
     const { page = 1, limit = 20, status, network, from, to } = req.query;
@@ -1211,7 +1276,7 @@ router.get('/details/:reference', protect, async (req, res) => {
   }
 });
 
-// 7. Get available products with pricing
+// 7. Get available products
 router.get('/products', optionalAuth, async (req, res) => {
   try {
     const { network, inStockOnly = 'true' } = req.query;
@@ -1386,20 +1451,15 @@ router.post('/retry/:reference', protect, async (req, res) => {
   }
 });
 
-// 10. Bulk Purchase Route - UPDATED WITH TELECEL PROCESSING
+// 10. Bulk Purchase with SAFE handling
 router.post('/bulk', protect, async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
   try {
-    console.log('Bulk purchase request received');
-    console.log('Request body:', req.body);
-    console.log('User:', req.user.email, req.user._id);
-    
     const { purchases, network, gateway = 'wallet' } = req.body;
     
-    const settings = await SystemSettings.getSettings();
-    const paystackConfig = await getPaystackConfig();
-    
     if (!purchases || !Array.isArray(purchases) || purchases.length === 0) {
-      console.log('Invalid purchases array:', purchases);
       return res.status(400).json({
         success: false,
         message: 'Please provide a valid purchases array'
@@ -1417,17 +1477,13 @@ router.post('/bulk', protect, async (req, res) => {
     const errors = [];
     let totalCost = 0;
 
+    // Validate all purchases
     for (let i = 0; i < purchases.length; i++) {
       const purchase = purchases[i];
-      console.log(`Processing purchase ${i + 1}:`, purchase);
       
       let phoneNumber = purchase.phoneNumber?.toString().trim();
       if (!phoneNumber) {
-        errors.push({
-          index: i,
-          phoneNumber: purchase.phoneNumber,
-          error: 'Missing phone number'
-        });
+        errors.push({ index: i, error: 'Missing phone number' });
         continue;
       }
 
@@ -1439,34 +1495,21 @@ router.post('/bulk', protect, async (req, res) => {
       }
 
       if (!/^0[2-9]\d{8}$/.test(phoneNumber)) {
-        errors.push({
-          index: i,
-          phoneNumber: purchase.phoneNumber,
-          error: 'Invalid phone number format'
-        });
+        errors.push({ index: i, error: 'Invalid phone number format' });
         continue;
       }
 
       const capacity = parseFloat(purchase.capacity);
       if (!capacity || capacity < 0.1 || capacity > 100) {
-        errors.push({
-          index: i,
-          phoneNumber: phoneNumber,
-          error: 'Invalid capacity (must be between 0.1 and 100 GB)'
-        });
+        errors.push({ index: i, error: 'Invalid capacity' });
         continue;
       }
 
       const purchaseNetwork = purchase.network || network || 'MTN';
       
       const stockCheck = await checkStockAvailability(purchaseNetwork, capacity, 'web');
-      
       if (!stockCheck.available) {
-        errors.push({
-          index: i,
-          phoneNumber: phoneNumber,
-          error: stockCheck.message
-        });
+        errors.push({ index: i, error: stockCheck.message });
         continue;
       }
 
@@ -1474,7 +1517,7 @@ router.post('/bulk', protect, async (req, res) => {
       totalCost += userPrice;
 
       validatedPurchases.push({
-        phoneNumber: phoneNumber,
+        phoneNumber,
         network: purchaseNetwork,
         capacity,
         price: userPrice,
@@ -1482,13 +1525,8 @@ router.post('/bulk', protect, async (req, res) => {
       });
     }
 
-    console.log('Validation complete:', {
-      valid: validatedPurchases.length,
-      errors: errors.length,
-      totalCost
-    });
-
     if (validatedPurchases.length === 0) {
+      await session.abortTransaction();
       return res.status(400).json({
         success: false,
         message: 'No valid purchases found',
@@ -1497,10 +1535,11 @@ router.post('/bulk', protect, async (req, res) => {
     }
 
     if (gateway === 'wallet') {
-      const user = await User.findById(req.user._id);
-      console.log('User wallet balance:', user.walletBalance, 'Total cost:', totalCost);
+      // Check balance FIRST
+      const user = await User.findById(req.user._id).session(session);
       
       if (user.walletBalance < totalCost) {
+        await session.abortTransaction();
         return res.status(400).json({
           success: false,
           message: 'Insufficient wallet balance',
@@ -1512,10 +1551,14 @@ router.post('/bulk', protect, async (req, res) => {
       }
 
       const batchReference = generateReference('BULK');
-      const purchaseIds = [];
+      const results = {
+        successful: [],
+        failed: []
+      };
 
+      // Process each purchase
       for (const validPurchase of validatedPurchases) {
-        const purchase = await DataPurchase.create({
+        const purchase = await DataPurchase.create([{
           userId: user._id,
           phoneNumber: validPurchase.phoneNumber,
           network: validPurchase.network,
@@ -1530,49 +1573,76 @@ router.post('/bulk', protect, async (req, res) => {
           },
           reference: generateReference('PURCHASE'),
           batchReference,
-          status: 'processing'
-        });
-        purchaseIds.push(purchase._id);
+          status: 'pending'
+        }], { session });
 
-        // Process TELECEL purchases immediately
-        if (purchase.network === 'TELECEL') {
-          await processTelecelPurchase(purchase);
+        // Attempt delivery
+        const deliveryResult = await attemptDelivery(purchase[0]);
+        
+        if (deliveryResult.success) {
+          purchase[0].status = 'completed';
+          purchase[0].deliveredAt = new Date();
+          purchase[0].deliveryDetails = deliveryResult;
+          await purchase[0].save({ session });
+          results.successful.push(validPurchase);
+        } else if (deliveryResult.requiresManual) {
+          purchase[0].status = 'processing';
+          purchase[0].adminNotes = 'Requires manual processing';
+          await purchase[0].save({ session });
+          results.successful.push(validPurchase);
+        } else {
+          purchase[0].status = 'failed';
+          purchase[0].failureReason = deliveryResult.error;
+          await purchase[0].save({ session });
+          results.failed.push({ ...validPurchase, reason: deliveryResult.error });
         }
       }
 
-      user.walletBalance -= totalCost;
-      await user.save();
+      // Calculate actual cost (only successful/processing)
+      const actualCost = results.successful.reduce((sum, p) => sum + p.price, 0);
+      
+      if (actualCost > 0) {
+        // Deduct money only for successful deliveries
+        user.walletBalance -= actualCost;
+        await user.save({ session });
 
-      await Transaction.create({
-        userId: user._id,
-        type: 'bulk_purchase',
-        amount: totalCost,
-        balanceBefore: user.walletBalance + totalCost,
-        balanceAfter: user.walletBalance,
-        reference: batchReference,
-        gateway: 'wallet',
-        status: 'completed',
-        description: `Bulk data purchase: ${validatedPurchases.length} items`
-      });
+        // Create transaction
+        await Transaction.create([{
+          userId: user._id,
+          type: 'bulk_purchase',
+          amount: actualCost,
+          balanceBefore: user.walletBalance + actualCost,
+          balanceAfter: user.walletBalance,
+          reference: batchReference,
+          gateway: 'wallet',
+          status: 'completed',
+          description: `Bulk purchase: ${results.successful.length}/${validatedPurchases.length} successful`
+        }], { session });
+      }
+
+      await session.commitTransaction();
 
       res.json({
         success: true,
-        message: 'Bulk purchase successful',
+        message: 'Bulk purchase processed',
         data: {
           batchReference,
-          totalPurchases: validatedPurchases.length,
-          totalCost,
+          totalAttempted: validatedPurchases.length,
+          successful: results.successful.length,
+          failed: results.failed.length,
+          totalCharged: actualCost,
           newBalance: user.walletBalance,
-          purchases: validatedPurchases.map(p => ({
-            phoneNumber: p.phoneNumber,
-            network: p.network,
-            capacity: p.capacity,
-            price: p.price
-          })),
-          errors: errors.length > 0 ? errors : undefined
+          results,
+          errors
         }
       });
+      
     } else {
+      // Paystack payment for bulk
+      await session.abortTransaction();
+      
+      const settings = await SystemSettings.getSettings();
+      const paystackConfig = await getPaystackConfig();
       const batchReference = generateReference('BULK');
       const purchaseIds = [];
 
@@ -1609,7 +1679,7 @@ router.post('/bulk', protect, async (req, res) => {
           userId: req.user._id,
           totalItems: validatedPurchases.length
         },
-        callback_url: `${process.env.FRONTEND_URL || settings.platform?.siteUrl}/purchase/verify/${batchReference}`,
+        callback_url: `${process.env.FRONTEND_URL}/purchase/verify/${batchReference}`,
         ...(paystackConfig.subaccountCode && {
           subaccount: paystackConfig.subaccountCode,
           bearer: 'account'
@@ -1624,7 +1694,7 @@ router.post('/bulk', protect, async (req, res) => {
           totalPurchases: validatedPurchases.length,
           totalCost,
           purchases: validatedPurchases,
-          errors: errors.length > 0 ? errors : undefined,
+          errors,
           paymentUrl: paystackResponse.data.data.authorization_url,
           accessCode: paystackResponse.data.data.access_code,
           publicKey: paystackConfig.publicKey
@@ -1633,22 +1703,21 @@ router.post('/bulk', protect, async (req, res) => {
     }
 
   } catch (error) {
+    await session.abortTransaction();
     console.error('Bulk purchase error:', error);
     res.status(500).json({
       success: false,
       message: 'Bulk purchase failed',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  } finally {
+    session.endSession();
   }
 });
 
 // 11. Parse Excel/CSV for bulk purchase
 router.post('/parse-excel', protect, upload.single('file'), async (req, res) => {
   try {
-    console.log('File upload request received');
-    console.log('File:', req.file);
-    console.log('Body:', req.body);
-
     if (!req.file) {
       return res.status(400).json({
         success: false,
@@ -1657,9 +1726,7 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
     }
 
     const { network } = req.body;
-
     const fileType = req.file.mimetype;
-    console.log('File type:', fileType);
 
     let data;
     try {
@@ -1683,8 +1750,6 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
       });
     }
 
-    console.log('Parsed data rows:', data.length);
-
     if (!data || data.length === 0) {
       return res.status(400).json({
         success: false,
@@ -1697,7 +1762,6 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
 
     for (let i = 0; i < data.length; i++) {
       const row = data[i];
-      console.log('Processing row:', i + 1, row);
       
       let phoneNumber = row['Phone Number'] || row['phone'] || row['phoneNumber'] || 
                        row['Phone'] || row['Number'] || row['Mobile'] || row['Tel'];
@@ -1745,9 +1809,6 @@ router.post('/parse-excel', protect, upload.single('file'), async (req, res) => 
         network: finalNetwork
       });
     }
-
-    console.log('Valid purchases:', purchases.length);
-    console.log('Errors:', errors.length);
 
     res.json({
       success: true,
@@ -1906,9 +1967,14 @@ router.post('/admin/process-telecel/:reference', protect, adminOnly, async (req,
       });
     }
 
-    const result = await processTelecelPurchase(purchase);
+    const result = await attemptDelivery(purchase);
     
-    if (result) {
+    if (result.success) {
+      purchase.status = 'completed';
+      purchase.deliveredAt = new Date();
+      purchase.deliveryDetails = result;
+      await purchase.save();
+      
       res.json({
         success: true,
         message: 'TELECEL bundle delivered successfully',
@@ -1922,7 +1988,7 @@ router.post('/admin/process-telecel/:reference', protect, adminOnly, async (req,
       res.status(400).json({
         success: false,
         message: 'Failed to deliver TELECEL bundle',
-        error: purchase.failureReason
+        error: result.error
       });
     }
     
@@ -1933,6 +1999,143 @@ router.post('/admin/process-telecel/:reference', protect, adminOnly, async (req,
       message: 'Processing failed',
       error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
+  }
+});
+
+// 16. Emergency recovery for failed wallet purchases
+router.post('/admin/emergency-recovery', protect, adminOnly, async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  
+  try {
+    // Find ALL failed purchases where wallet was charged
+    const failedPurchases = await DataPurchase.find({
+      status: { $in: ['failed', 'processing'] },
+      gateway: 'wallet',
+      createdAt: { 
+        $gte: new Date(Date.now() - 24 * 60 * 60 * 1000) // Last 24 hours
+      }
+    }).populate('userId');
+
+    const recovery = {
+      autoDelivered: [],
+      refunded: [],
+      errors: []
+    };
+
+    for (const purchase of failedPurchases) {
+      try {
+        // Check if money was actually taken
+        const transaction = await Transaction.findOne({
+          relatedPurchaseId: purchase._id,
+          type: { $in: ['purchase', 'bulk_purchase'] },
+          status: 'completed',
+          gateway: 'wallet'
+        });
+
+        if (!transaction) {
+          continue; // No money was taken, skip
+        }
+
+        // Try to deliver first
+        const deliveryResult = await attemptDelivery(purchase);
+        
+        if (deliveryResult.success) {
+          purchase.status = 'completed';
+          purchase.deliveredAt = new Date();
+          purchase.deliveryDetails = deliveryResult;
+          await purchase.save({ session });
+          
+          recovery.autoDelivered.push({
+            reference: purchase.reference,
+            network: purchase.network,
+            phoneNumber: purchase.phoneNumber,
+            amount: purchase.price
+          });
+          
+          await Notification.create([{
+            userId: purchase.userId._id,
+            title: 'Delayed Delivery Successful',
+            message: `Your ${purchase.capacity}GB ${purchase.network} data has been successfully delivered to ${purchase.phoneNumber}`,
+            type: 'success',
+            category: 'delivery'
+          }], { session });
+          
+        } else {
+          // Refund the customer
+          const user = await User.findById(purchase.userId._id).session(session);
+          const refundAmount = purchase.price;
+          
+          user.walletBalance += refundAmount;
+          await user.save({ session });
+          
+          await Transaction.create([{
+            userId: user._id,
+            type: 'refund',
+            amount: refundAmount,
+            balanceBefore: user.walletBalance - refundAmount,
+            balanceAfter: user.walletBalance,
+            reference: `REFUND-${purchase.reference}`,
+            gateway: 'wallet',
+            status: 'completed',
+            relatedPurchaseId: purchase._id,
+            description: `Emergency refund for failed purchase: ${purchase.reference}`
+          }], { session });
+          
+          purchase.status = 'refunded';
+          purchase.refundedAt = new Date();
+          purchase.refundAmount = refundAmount;
+          purchase.refundReason = 'Automatic refund - delivery failed';
+          await purchase.save({ session });
+          
+          recovery.refunded.push({
+            reference: purchase.reference,
+            userId: user.email,
+            amount: refundAmount,
+            newBalance: user.walletBalance
+          });
+          
+          await Notification.create([{
+            userId: user._id,
+            title: 'Purchase Refunded',
+            message: `We've refunded ₵${refundAmount} to your wallet for the failed ${purchase.capacity}GB ${purchase.network} purchase.`,
+            type: 'info',
+            category: 'refund'
+          }], { session });
+        }
+        
+      } catch (error) {
+        recovery.errors.push({
+          reference: purchase.reference,
+          error: error.message
+        });
+      }
+    }
+
+    await session.commitTransaction();
+    
+    res.json({
+      success: true,
+      message: 'Emergency recovery completed',
+      summary: {
+        totalProcessed: failedPurchases.length,
+        delivered: recovery.autoDelivered.length,
+        refunded: recovery.refunded.length,
+        errors: recovery.errors.length
+      },
+      details: recovery
+    });
+
+  } catch (error) {
+    await session.abortTransaction();
+    console.error('[RECOVERY] Emergency recovery failed:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Emergency recovery failed',
+      error: error.message
+    });
+  } finally {
+    session.endSession();
   }
 });
 
