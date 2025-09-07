@@ -38,14 +38,6 @@ class TelecelAuthService {
     try {
       console.log('[TELECEL AUTH] Requesting OTP...');
       
-      // MOCK MODE FOR TESTING - Comment this block and uncomment the real API call when ready
-      console.log('[TELECEL AUTH] Running in MOCK MODE - not actually calling Telecel API');
-      return {
-        success: true,
-        message: 'OTP sent to registered phone number (MOCK MODE - No actual OTP sent)'
-      };
-      
-      /* UNCOMMENT THIS FOR PRODUCTION
       const response = await axios.post(
         `${this.baseURL}/enterprise-request/api/check-login`,
         {
@@ -80,7 +72,6 @@ class TelecelAuthService {
         success: true,
         message: 'OTP sent to registered phone number'
       };
-      */
 
     } catch (error) {
       console.error('[TELECEL AUTH] Error requesting OTP:', error.message);
@@ -93,47 +84,6 @@ class TelecelAuthService {
     try {
       console.log('[TELECEL AUTH] Logging in with OTP...');
       
-      // MOCK MODE FOR TESTING - Accept any 6-digit code
-      console.log('[TELECEL AUTH] Running in MOCK MODE - accepting any 6-digit code');
-      
-      if (!otpCode || otpCode.length !== 6) {
-        throw new Error('OTP must be 6 digits');
-      }
-      
-      // Mock success for testing
-      const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
-      const mockToken = 'mock_token_' + Date.now();
-      
-      // Deactivate old tokens
-      await TelecelToken.updateMany(
-        { isActive: true },
-        { $set: { isActive: false } }
-      );
-      
-      // Save new mock token
-      const newToken = new TelecelToken({
-        token: mockToken,
-        email: this.credentials.email,
-        phoneNumber: this.credentials.phoneNumber,
-        subscriberMsisdn: '233509240147',
-        isActive: true,
-        expiresAt: expiresAt,
-        otpStatus: {
-          lastOtpUsed: otpCode,
-          waitingForOtp: false
-        }
-      });
-      
-      await newToken.save();
-      
-      console.log('[TELECEL AUTH] Mock login successful, token saved');
-      return {
-        success: true,
-        token: mockToken,
-        expiresAt: expiresAt
-      };
-      
-      /* UNCOMMENT THIS FOR PRODUCTION
       const response = await axios.post(
         `${this.baseURL}/enterprise-request/api/login`,
         {
@@ -187,7 +137,6 @@ class TelecelAuthService {
       }
 
       throw new Error('No token received from login response');
-      */
 
     } catch (error) {
       console.error('[TELECEL AUTH] Login error:', error.message);
@@ -267,5 +216,5 @@ class TelecelAuthService {
   }
 }
 
-// THIS WAS MISSING! - Export the class so it can be imported elsewhere
+// Export the class so it can be imported elsewhere
 module.exports = TelecelAuthService;
