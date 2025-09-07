@@ -129,6 +129,7 @@ const SystemSettingsSchema = new mongoose.Schema({
       enabled: { type: Boolean, default: true },
       publicKey: { type: String },
       secretKey: { type: String },
+      storesApikey: { type: String }, // New field for stores API key
       webhookUrl: { type: String },
       transactionFee: { type: Number, default: 1.95 }, // percentage
       capAt: { type: Number, default: 100 }, // cap fee at amount

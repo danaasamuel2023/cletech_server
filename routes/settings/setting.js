@@ -196,7 +196,7 @@ router.put('/financial', async (req, res) => {
 });
 
 // @route   PUT /api/admin/settings/payment-gateway
-// @desc    Update payment gateway settings
+// @desc    Update payment gateway settings - UPDATED WITH storesApikey MASKING
 // @access  Admin only
 router.put('/payment-gateway', async (req, res) => {
   try {
@@ -231,8 +231,12 @@ router.put('/payment-gateway', async (req, res) => {
 
     // Mask sensitive data in response
     const responseData = JSON.parse(JSON.stringify(settings.paymentGateway));
-    if (responseData.paystack.secretKey) {
+    if (responseData.paystack?.secretKey) {
       responseData.paystack.secretKey = '***' + responseData.paystack.secretKey.slice(-4);
+    }
+    // UPDATED: Mask the new storesApikey field
+    if (responseData.paystack?.storesApikey) {
+      responseData.paystack.storesApikey = '***' + responseData.paystack.storesApikey.slice(-4);
     }
 
     res.json({
@@ -688,7 +692,7 @@ router.post('/reset/:category', async (req, res) => {
 });
 
 // @route   GET /api/admin/settings/export
-// @desc    Export all settings
+// @desc    Export all settings - UPDATED WITH storesApikey REDACTION
 // @access  Admin only
 router.get('/export', async (req, res) => {
   try {
@@ -700,6 +704,10 @@ router.get('/export', async (req, res) => {
     // Mask sensitive fields
     if (exportData.paymentGateway?.paystack?.secretKey) {
       exportData.paymentGateway.paystack.secretKey = '[REDACTED]';
+    }
+    // UPDATED: Redact the new storesApikey field
+    if (exportData.paymentGateway?.paystack?.storesApikey) {
+      exportData.paymentGateway.paystack.storesApikey = '[REDACTED]';
     }
     if (exportData.notifications?.email?.smtp?.password) {
       exportData.notifications.email.smtp.password = '[REDACTED]';

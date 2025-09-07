@@ -1,5 +1,5 @@
 // ==================== routes/Datapurchase/order.js ====================
-// COMPLETE SAFE PURCHASE ROUTES - NO MONEY DEDUCTED ON ERRORS
+// COMPLETE SAFE PURCHASE ROUTES WITH STORES API KEY SUPPORT
 
 const express = require('express');
 const router = express.Router();
@@ -312,7 +312,9 @@ const processWalletPaymentSafe = async (userId, amount, reference, purchase) => 
 };
 
 // ==================== PAYSTACK CONFIGURATION ====================
-const getPaystackConfig = async () => {
+
+// UPDATED: Support for separate stores API key
+const getPaystackConfig = async (isStorePurchase = false) => {
   try {
     const settings = await SystemSettings.getSettings();
     
@@ -320,7 +322,20 @@ const getPaystackConfig = async () => {
       throw new Error('Paystack payment gateway is disabled');
     }
     
-    const secretKey = settings.paymentGateway.paystack.secretKey || process.env.PAYSTACK_SECRET_KEY;
+    // Choose the appropriate API key based on purchase type
+    let secretKey;
+    if (isStorePurchase && settings.paymentGateway.paystack.storesApikey) {
+      // Use stores API key for agent store purchases if available
+      secretKey = settings.paymentGateway.paystack.storesApikey;
+      console.log('[PAYSTACK] Using stores API key for agent store purchase');
+    } else {
+      // Use regular secret key for direct purchases or if stores key not configured
+      secretKey = settings.paymentGateway.paystack.secretKey || process.env.PAYSTACK_SECRET_KEY;
+      if (isStorePurchase && !settings.paymentGateway.paystack.storesApikey) {
+        console.log('[PAYSTACK] Stores API key not configured, using default key');
+      }
+    }
+    
     const publicKey = settings.paymentGateway.paystack.publicKey || process.env.PAYSTACK_PUBLIC_KEY;
     
     if (!secretKey || !publicKey) {
@@ -333,8 +348,7 @@ const getPaystackConfig = async () => {
       webhookUrl: settings.paymentGateway.paystack.webhookUrl,
       transactionFee: settings.paymentGateway.paystack.transactionFee || 1.95,
       capAt: settings.paymentGateway.paystack.capAt || 100,
-      splitPayment: settings.paymentGateway.paystack.splitPayment || false,
-      subaccountCode: settings.paymentGateway.paystack.subaccountCode
+      isStorePurchase
     };
   } catch (error) {
     console.error('Paystack config error:', error);
@@ -344,14 +358,13 @@ const getPaystackConfig = async () => {
       webhookUrl: process.env.PAYSTACK_WEBHOOK_URL,
       transactionFee: 1.95,
       capAt: 100,
-      splitPayment: false,
-      subaccountCode: null
+      isStorePurchase: false
     };
   }
 };
 
-const getPaystackAPI = async () => {
-  const config = await getPaystackConfig();
+const getPaystackAPI = async (isStorePurchase = false) => {
+  const config = await getPaystackConfig(isStorePurchase);
   
   return axios.create({
     baseURL: 'https://api.paystack.co',
@@ -575,14 +588,15 @@ deleteAbandonedOrders().then(count => {
 
 // ==================== MAIN PURCHASE ROUTES ====================
 
-// 1. Purchase data with SAFE wallet handling
+// 1. Purchase data with SAFE wallet handling (uses regular API key)
 router.post('/buy', protect, validatePurchase, checkValidation, async (req, res) => {
   try {
     const { phoneNumber, network, capacity, gateway } = req.body;
     const userId = req.user._id;
 
     const settings = await SystemSettings.getSettings();
-    const paystackConfig = await getPaystackConfig();
+    // Use regular API key for direct purchases
+    const paystackConfig = await getPaystackConfig(false);
 
     // Check stock
     const stockCheck = await checkStockAvailability(network, capacity, 'web');
@@ -624,7 +638,7 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
         agentProfit: 0
       },
       reference,
-      status: 'pending' // Always start as pending
+      status: 'pending'
     });
 
     if (gateway === 'wallet') {
@@ -670,8 +684,8 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
       }
       
     } else {
-      // Paystack payment
-      const paystackAPI = await getPaystackAPI();
+      // Paystack payment with regular API key
+      const paystackAPI = await getPaystackAPI(false);
       const paystackResponse = await paystackAPI.post('/transaction/initialize', {
         email: req.user.email,
         amount: userPrice * 100,
@@ -682,13 +696,10 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
           userId,
           network,
           capacity,
-          phoneNumber
+          phoneNumber,
+          isStorePurchase: false
         },
-        callback_url: `${process.env.FRONTEND_URL || settings?.platform?.siteUrl}/verify/store/${reference}`,
-        ...(paystackConfig.subaccountCode && {
-          subaccount: paystackConfig.subaccountCode,
-          bearer: 'account'
-        })
+        callback_url: `${process.env.FRONTEND_URL || settings?.platform?.siteUrl}/verify/store/${reference}`
       });
 
       res.json({
@@ -719,14 +730,15 @@ router.post('/buy', protect, validatePurchase, checkValidation, async (req, res)
   }
 });
 
-// 2. Purchase through agent store
+// 2. Purchase through agent store (UPDATED to use stores API key)
 router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation, async (req, res) => {
   try {
     const { subdomain } = req.params;
     const { phoneNumber, network, capacity, customerEmail, customerName } = req.body;
 
     const settings = await SystemSettings.getSettings();
-    const paystackConfig = await getPaystackConfig();
+    // Use stores API key for agent store purchases
+    const paystackConfig = await getPaystackConfig(true);
 
     const store = await AgentStore.findOne({ 
       subdomain: subdomain.toLowerCase(),
@@ -836,14 +848,11 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         customerName: customerName || 'Guest'
       },
       callback_url: `${process.env.FRONTEND_URL || settings?.platform?.siteUrl}/verify/store/${reference}?subdomain=${subdomain}`,
-      channels: ['card', 'bank', 'mobile_money'],
-      ...(paystackConfig.subaccountCode && {
-        subaccount: paystackConfig.subaccountCode,
-        bearer: 'account'
-      })
+      channels: ['card', 'bank', 'mobile_money']
     };
 
-    const paystackAPI = await getPaystackAPI();
+    // Use stores API key for agent store purchases
+    const paystackAPI = await getPaystackAPI(true);
     const paystackResponse = await paystackAPI.post('/transaction/initialize', paystackPayload);
 
     if (!paystackResponse.data.status || !paystackResponse.data.data.authorization_url) {
@@ -855,6 +864,8 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
         message: 'Payment initialization failed. Please try again.'
       });
     }
+
+    console.log(`[STORE PURCHASE] Initialized payment for store: ${store.storeName} using ${paystackConfig.isStorePurchase ? 'stores' : 'default'} API key`);
 
     res.json({
       success: true,
@@ -884,14 +895,16 @@ router.post('/store/:subdomain', optionalAuth, validatePurchase, checkValidation
   }
 });
 
-// 3. PAYSTACK WEBHOOK HANDLER
+// 3. PAYSTACK WEBHOOK HANDLER (UPDATED to handle both API keys)
 router.post('/webhook/paystack', async (req, res) => {
   try {
     console.log('[WEBHOOK] Received Paystack webhook');
     
-    const paystackConfig = await getPaystackConfig();
+    // Check metadata to determine which API key to use
+    const isStorePurchase = req.body?.data?.metadata?.isStorePurchase || false;
+    const paystackConfig = await getPaystackConfig(isStorePurchase);
     
-    // Verify webhook signature
+    // Verify webhook signature with the appropriate key
     const hash = crypto
       .createHmac('sha512', paystackConfig.secretKey)
       .update(JSON.stringify(req.body))
@@ -930,7 +943,8 @@ router.post('/webhook/paystack', async (req, res) => {
           channel: successData.channel,
           paidAt: successData.paid_at,
           fees: successData.fees ? successData.fees / 100 : 0,
-          customerEmail: successData.customer.email
+          customerEmail: successData.customer.email,
+          apiKeyType: isStorePurchase ? 'stores' : 'default'
         };
 
         // Attempt delivery
@@ -1053,7 +1067,7 @@ router.post('/webhook/paystack', async (req, res) => {
   }
 });
 
-// 4. Verify payment
+// 4. Verify payment (UPDATED to handle verification with appropriate key)
 router.get('/verify/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
@@ -1083,7 +1097,10 @@ router.get('/verify/:reference', async (req, res) => {
       });
     }
 
-    const paystackAPI = await getPaystackAPI();
+    // Determine which API key to use based on purchase method
+    const isStorePurchase = purchases[0].method === 'agent_store';
+    const paystackAPI = await getPaystackAPI(isStorePurchase);
+    
     const verifyResponse = await paystackAPI.get(`/transaction/verify/${reference}`);
 
     const paymentData = verifyResponse.data.data;
@@ -1176,7 +1193,7 @@ router.get('/history', protect, async (req, res) => {
 
     const filter = { 
       userId: req.user._id,
-      status: { $ne: 'pending' } // Exclude pending orders
+      status: { $ne: 'pending' }
     };
     if (status && status !== 'pending') filter.status = status;
     if (network) filter.network = network;
@@ -1401,7 +1418,8 @@ router.post('/retry/:reference', protect, async (req, res) => {
     }
 
     const settings = await SystemSettings.getSettings();
-    const paystackConfig = await getPaystackConfig();
+    const isStorePurchase = purchase.method === 'agent_store';
+    const paystackConfig = await getPaystackConfig(isStorePurchase);
 
     const newReference = generateReference('RETRY');
     
@@ -1413,7 +1431,7 @@ router.post('/retry/:reference', protect, async (req, res) => {
       createdAt: new Date()
     });
 
-    const paystackAPI = await getPaystackAPI();
+    const paystackAPI = await getPaystackAPI(isStorePurchase);
     const paystackResponse = await paystackAPI.post('/transaction/initialize', {
       email: req.user.email,
       amount: purchase.price * 100,
@@ -1422,12 +1440,9 @@ router.post('/retry/:reference', protect, async (req, res) => {
       metadata: {
         purchaseId: newPurchase._id,
         retry: true,
-        originalReference: reference
-      },
-      ...(paystackConfig.subaccountCode && {
-        subaccount: paystackConfig.subaccountCode,
-        bearer: 'account'
-      })
+        originalReference: reference,
+        isStorePurchase
+      }
     });
 
     res.json({
@@ -1642,7 +1657,7 @@ router.post('/bulk', protect, async (req, res) => {
       await session.abortTransaction();
       
       const settings = await SystemSettings.getSettings();
-      const paystackConfig = await getPaystackConfig();
+      const paystackConfig = await getPaystackConfig(false);
       const batchReference = generateReference('BULK');
       const purchaseIds = [];
 
@@ -1667,7 +1682,7 @@ router.post('/bulk', protect, async (req, res) => {
         purchaseIds.push(purchase._id);
       }
 
-      const paystackAPI = await getPaystackAPI();
+      const paystackAPI = await getPaystackAPI(false);
       const paystackResponse = await paystackAPI.post('/transaction/initialize', {
         email: req.user.email,
         amount: totalCost * 100,
@@ -1677,13 +1692,10 @@ router.post('/bulk', protect, async (req, res) => {
           type: 'bulk_purchase',
           purchaseIds,
           userId: req.user._id,
-          totalItems: validatedPurchases.length
+          totalItems: validatedPurchases.length,
+          isStorePurchase: false
         },
-        callback_url: `${process.env.FRONTEND_URL}/purchase/verify/${batchReference}`,
-        ...(paystackConfig.subaccountCode && {
-          subaccount: paystackConfig.subaccountCode,
-          bearer: 'account'
-        })
+        callback_url: `${process.env.FRONTEND_URL}/purchase/verify/${batchReference}`
       });
 
       res.json({
