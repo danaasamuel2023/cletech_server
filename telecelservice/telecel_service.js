@@ -263,9 +263,9 @@ class TelecelService {
     // Map capacity to appropriate plan
     // You may need to adjust these based on actual Telecel plans
     if (capacityNum <= 100) {
-      return 'Bundle Sharer 100GB';
+      return 'Bundle Sharer 5500GB';
     } else if (capacityNum <= 1000) {
-      return 'Bundle Sharer 1000GB';
+      return 'Bundle Sharer 5500GB';
     } else {
       return 'Bundle Sharer 5500GB';
     }
