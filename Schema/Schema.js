@@ -451,7 +451,7 @@ const DataPricingSchema = new mongoose.Schema({
     agent: { type: Number, required: true }, // Price for agents (minimum they can sell for)
     user: { type: Number, required: true } // Price for direct users
   },
-  
+
   // Stock Management - Each capacity can be individually marked as out of stock
   stock: {
     webInStock: { 
@@ -574,6 +574,17 @@ const DataPurchaseSchema = new mongoose.Schema({
     type: Boolean, 
     default: false 
   },
+    whatsappAlertSent: {
+    type: Boolean,
+    default: false
+  },
+  whatsappAlertAt: {
+    type: Date
+  },
+  whatsappAlertId: {
+    type: String
+  },
+  
   
   // Admin Management
   adminNotes: { 
