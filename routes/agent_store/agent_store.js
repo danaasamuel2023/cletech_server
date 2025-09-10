@@ -1,10 +1,12 @@
 // ==================== routes/agentStore.js ====================
-// Complete Agent Store Management Routes File with Required WhatsApp Group Link
+// Complete Agent Store Management Routes File with Paystack Withdrawal Integration
 
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const path = require('path');
+const axios = require('axios');
+const crypto = require('crypto');
 const { 
   AgentStore, 
   User, 
@@ -13,6 +15,7 @@ const {
   DataPurchase,
   Transaction 
 } = require('../../Schema/Schema');
+const SystemSettings = require('../../settingsSchema/schema');
 
 // ==================== MIDDLEWARE ====================
 const jwt = require('jsonwebtoken');
@@ -73,6 +76,57 @@ const hasStore = async (req, res, next) => {
       message: 'Error checking store'
     });
   }
+};
+
+// ==================== PAYSTACK CONFIGURATION ====================
+// Get Paystack configuration from settings (uses regular API key for withdrawals)
+const getPaystackConfig = async () => {
+  try {
+    const settings = await SystemSettings.getSettings();
+    
+    if (!settings.paymentGateway?.paystack?.enabled) {
+      throw new Error('Paystack payment gateway is disabled');
+    }
+    
+    // Use regular secret key for withdrawals (not stores API key)
+    const secretKey = settings.paymentGateway.paystack.secretKey || process.env.PAYSTACK_SECRET_KEY;
+    const publicKey = settings.paymentGateway.paystack.publicKey || process.env.PAYSTACK_PUBLIC_KEY;
+    
+    if (!secretKey || !publicKey) {
+      throw new Error('Paystack keys not configured');
+    }
+    
+    return {
+      secretKey,
+      publicKey,
+      webhookUrl: settings.paymentGateway.paystack.webhookUrl,
+      transactionFee: settings.paymentGateway.paystack.transactionFee || 1.95,
+      capAt: settings.paymentGateway.paystack.capAt || 100
+    };
+  } catch (error) {
+    console.error('Paystack config error:', error);
+    // Fallback to environment variables
+    return {
+      secretKey: process.env.PAYSTACK_SECRET_KEY,
+      publicKey: process.env.PAYSTACK_PUBLIC_KEY,
+      webhookUrl: process.env.PAYSTACK_WEBHOOK_URL,
+      transactionFee: 1.95,
+      capAt: 100
+    };
+  }
+};
+
+// Create Paystack API instance
+const getPaystackAPI = async () => {
+  const config = await getPaystackConfig();
+  
+  return axios.create({
+    baseURL: 'https://api.paystack.co',
+    headers: {
+      'Authorization': `Bearer ${config.secretKey}`,
+      'Content-Type': 'application/json'
+    }
+  });
 };
 
 // File upload configuration
@@ -147,6 +201,28 @@ const validatePricing = [
     .withMessage('Price must be a positive number')
 ];
 
+const validateBankAccount = [
+  body('accountNumber')
+    .trim()
+    .notEmpty().withMessage('Account number is required')
+    .matches(/^\d{10,}$/).withMessage('Invalid account number format'),
+  body('bankCode')
+    .trim()
+    .notEmpty().withMessage('Bank code is required'),
+  body('accountName')
+    .trim()
+    .notEmpty().withMessage('Account name is required')
+];
+
+const validateWithdrawal = [
+  body('amount')
+    .isFloat({ min: 10 }).withMessage('Minimum withdrawal amount is 10 GHS'),
+  body('reason')
+    .optional()
+    .trim()
+    .isLength({ max: 200 }).withMessage('Reason must not exceed 200 characters')
+];
+
 const checkValidation = (req, res, next) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) {
@@ -164,14 +240,14 @@ const checkValidation = (req, res, next) => {
 
 // ==================== STORE MANAGEMENT ROUTES ====================
 
-// 1. Create store - UPDATED WITH REQUIRED WHATSAPP GROUP LINK
+// 1. Create store
 router.post('/create', protect, validateStoreCreation, checkValidation, async (req, res) => {
   try {
     const { 
       storeName, 
       subdomain, 
       whatsappNumber,
-      whatsappGroupLink, // Required field
+      whatsappGroupLink,
       description,
       contactEmail,
       alternativePhone 
@@ -205,13 +281,13 @@ router.post('/create', protect, validateStoreCreation, checkValidation, async (r
       });
     }
 
-    // Create store with required WhatsApp group link
+    // Create store
     const store = await AgentStore.create({
       agent: req.user._id,
       storeName,
       subdomain: subdomain.toLowerCase(),
       whatsappNumber,
-      whatsappGroupLink, // Required field
+      whatsappGroupLink,
       description: description || '',
       contactEmail: contactEmail || req.user.email,
       alternativePhone: alternativePhone || '',
@@ -243,7 +319,6 @@ router.post('/create', protect, validateStoreCreation, checkValidation, async (r
       verificationStatus: 'pending'
     });
 
-    // Log store creation
     console.log(`New store created: ${store.subdomain} by user: ${req.user._id}`);
 
     res.status(201).json({
@@ -271,7 +346,7 @@ router.post('/create', protect, validateStoreCreation, checkValidation, async (r
   }
 });
 
-// 2. Get my store details - UPDATED TO INCLUDE WHATSAPP GROUP LINK
+// 2. Get my store details
 router.get('/my-store', protect, async (req, res) => {
   try {
     const store = await AgentStore.findOne({ agent: req.user._id });
@@ -356,8 +431,14 @@ router.get('/my-store', protect, async (req, res) => {
       total: storeData.statistics?.totalProfit || 0
     };
 
-    // Ensure WhatsApp group link is included
-    storeData.whatsappGroupLink = store.whatsappGroupLink;
+    // Include bank details if available
+    storeData.bankDetails = req.user.bankDetails ? {
+      hasAccount: true,
+      accountNumber: req.user.bankDetails.accountNumber?.slice(0, 3) + '****' + req.user.bankDetails.accountNumber?.slice(-3),
+      accountName: req.user.bankDetails.accountName,
+      bankCode: req.user.bankDetails.bankCode,
+      isVerified: req.user.bankDetails.isVerified
+    } : { hasAccount: false };
 
     res.json({
       success: true,
@@ -374,14 +455,14 @@ router.get('/my-store', protect, async (req, res) => {
   }
 });
 
-// 3. Update store settings - UPDATED TO INCLUDE WHATSAPP GROUP LINK
+// 3. Update store settings
 router.patch('/settings', protect, hasStore, async (req, res) => {
   try {
     const allowedUpdates = [
       'storeName',
       'description',
       'whatsappNumber',
-      'whatsappGroupLink', // Allow updating WhatsApp group link
+      'whatsappGroupLink',
       'contactEmail',
       'alternativePhone',
       'businessHours',
@@ -801,96 +882,579 @@ router.get('/profits', protect, async (req, res) => {
   }
 });
 
-// 10. Withdraw profits to wallet
-router.post('/withdraw-profit', protect, async (req, res) => {
-  try {
-    const { amount } = req.body;
+// ==================== BANK ACCOUNT MANAGEMENT ROUTES ====================
 
-    if (!amount || amount <= 0) {
+// 10. Add bank account to user profile
+router.post('/bank-account', protect, validateBankAccount, checkValidation, async (req, res) => {
+  try {
+    const { 
+      accountNumber, 
+      bankCode, 
+      accountName 
+    } = req.body;
+
+    const paystackAPI = await getPaystackAPI();
+
+    // Verify bank account with Paystack
+    const verifyResponse = await paystackAPI.get(
+      `/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`
+    );
+
+    if (!verifyResponse.data.status) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide a valid amount'
+        message: 'Unable to verify bank account'
       });
     }
 
-    // Check available profit
-    if (req.user.agentProfit < amount) {
+    const verifiedAccountName = verifyResponse.data.data.account_name;
+
+    // Create transfer recipient on Paystack
+    const recipientResponse = await paystackAPI.post('/transferrecipient', {
+      type: 'nuban',
+      name: verifiedAccountName,
+      account_number: accountNumber,
+      bank_code: bankCode,
+      currency: 'GHS', // Ghana Cedis
+      description: `Agent withdrawal account for ${req.user.name}`
+    });
+
+    if (!recipientResponse.data.status) {
+      return res.status(400).json({
+        success: false,
+        message: 'Failed to create transfer recipient'
+      });
+    }
+
+    // Save bank details to user profile
+    req.user.bankDetails = {
+      accountNumber,
+      bankCode,
+      accountName: verifiedAccountName,
+      recipientCode: recipientResponse.data.data.recipient_code,
+      isVerified: true,
+      addedAt: new Date()
+    };
+
+    await req.user.save();
+
+    res.json({
+      success: true,
+      message: 'Bank account added successfully',
+      data: {
+        accountNumber: accountNumber.slice(0, 3) + '****' + accountNumber.slice(-3),
+        accountName: verifiedAccountName,
+        bankCode
+      }
+    });
+
+  } catch (error) {
+    console.error('Bank account error:', error.response?.data || error);
+    res.status(500).json({
+      success: false,
+      message: error.response?.data?.message || 'Failed to add bank account'
+    });
+  }
+});
+
+// 11. Get saved bank accounts
+router.get('/bank-accounts', protect, async (req, res) => {
+  try {
+    if (!req.user.bankDetails) {
+      return res.status(404).json({
+        success: false,
+        message: 'No bank account found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        accountNumber: req.user.bankDetails.accountNumber.slice(0, 3) + '****' + req.user.bankDetails.accountNumber.slice(-3),
+        accountName: req.user.bankDetails.accountName,
+        bankCode: req.user.bankDetails.bankCode,
+        isVerified: req.user.bankDetails.isVerified
+      }
+    });
+
+  } catch (error) {
+    console.error('Get bank accounts error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch bank accounts'
+    });
+  }
+});
+
+// 12. Get list of banks
+router.get('/banks', protect, async (req, res) => {
+  try {
+    const paystackAPI = await getPaystackAPI();
+    const response = await paystackAPI.get('/bank?country=ghana');
+    
+    if (!response.data.status) {
+      throw new Error('Failed to fetch banks');
+    }
+
+    const banks = response.data.data.map(bank => ({
+      id: bank.id,
+      name: bank.name,
+      code: bank.code,
+      slug: bank.slug
+    }));
+
+    res.json({
+      success: true,
+      data: banks
+    });
+
+  } catch (error) {
+    console.error('Get banks error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch banks'
+    });
+  }
+});
+
+// ==================== WITHDRAWAL ROUTES WITH PAYSTACK ====================
+
+// 13. Withdraw profits via Paystack
+// 13. Withdraw profits via Paystack - UPDATED VERSION
+router.post('/withdraw-profit', protect, validateWithdrawal, checkValidation, async (req, res) => {
+  try {
+    const { 
+      amount, 
+      reason = 'Agent profit withdrawal',
+      useSavedAccount = true,
+      accountNumber,
+      bankCode 
+    } = req.body;
+
+    // Check minimum withdrawal amount (10 GHS)
+    const MIN_WITHDRAWAL = 10;
+    if (amount < MIN_WITHDRAWAL) {
+      return res.status(400).json({
+        success: false,
+        message: `Minimum withdrawal amount is ${MIN_WITHDRAWAL} GHS`
+      });
+    }
+
+    // IMPORTANT FIX: Calculate actual available balance from AgentProfit records
+    const actualBalanceResult = await AgentProfit.aggregate([
+      {
+        $match: {
+          agentId: req.user._id,
+          status: 'credited'
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: '$profit' }
+        }
+      }
+    ]);
+
+    const availableBalance = actualBalanceResult[0]?.total || 0;
+    
+    console.log(`Withdrawal attempt - Requested: ${amount}, Available: ${availableBalance}`);
+
+    // Check against ACTUAL calculated balance, not user field
+    if (amount > availableBalance) {
       return res.status(400).json({
         success: false,
         message: 'Insufficient profit balance',
         data: {
           requested: amount,
-          available: req.user.agentProfit
+          available: availableBalance
         }
       });
     }
 
-    // Process withdrawal
-    const balanceBefore = req.user.walletBalance;
-    const profitBefore = req.user.agentProfit;
-
-    // Update user balances
-    req.user.agentProfit -= amount;
-    req.user.walletBalance += amount;
-    await req.user.save();
-
-    // Create transaction record
-    const reference = `PROFIT-${Date.now()}-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
+    const paystackAPI = await getPaystackAPI();
     
-    await Transaction.create({
+    // Get recipient code
+    let recipientCode;
+
+    if (useSavedAccount) {
+      // Use saved bank account
+      if (!req.user.bankDetails || !req.user.bankDetails.recipientCode) {
+        return res.status(400).json({
+          success: false,
+          message: 'No bank account found. Please add a bank account first.'
+        });
+      }
+      recipientCode = req.user.bankDetails.recipientCode;
+    } else {
+      // Create one-time recipient
+      if (!accountNumber || !bankCode) {
+        return res.status(400).json({
+          success: false,
+          message: 'Please provide account number and bank code'
+        });
+      }
+
+      // Verify account
+      const verifyResponse = await paystackAPI.get(
+        `/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`
+      );
+
+      if (!verifyResponse.data.status) {
+        return res.status(400).json({
+          success: false,
+          message: 'Unable to verify bank account'
+        });
+      }
+
+      // Create temporary recipient
+      const recipientResponse = await paystackAPI.post('/transferrecipient', {
+        type: 'nuban',
+        name: verifyResponse.data.data.account_name,
+        account_number: accountNumber,
+        bank_code: bankCode,
+        currency: 'GHS'
+      });
+
+      if (!recipientResponse.data.status) {
+        return res.status(400).json({
+          success: false,
+          message: 'Failed to create transfer recipient'
+        });
+      }
+
+      recipientCode = recipientResponse.data.data.recipient_code;
+    }
+
+    // Generate unique reference
+    const reference = `PROFIT-WD-${Date.now()}-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
+
+    // Create withdrawal record (pending) - use actual balance
+    const withdrawal = await Transaction.create({
       userId: req.user._id,
-      type: 'agent_profit',
+      type: 'agent_profit_withdrawal',
       amount,
-      balanceBefore,
-      balanceAfter: req.user.walletBalance,
+      balanceBefore: availableBalance,
+      balanceAfter: availableBalance - amount,
       reference,
-      gateway: 'system',
-      status: 'completed',
-      description: `Agent profit withdrawal: ${amount} GHS`,
-      profitDetails: {
-        profit: amount
+      gateway: 'paystack',
+      status: 'pending',
+      description: reason,
+      withdrawalDetails: {
+        recipientCode,
+        accountNumber: req.user.bankDetails?.accountNumber || accountNumber,
+        bankCode: req.user.bankDetails?.bankCode || bankCode
       }
     });
 
-    // Update agent profit records
-    await AgentProfit.updateMany(
+    // Initiate transfer with Paystack
+    try {
+      const transferResponse = await paystackAPI.post('/transfer', {
+        source: 'balance',
+        amount: amount * 100, // Convert to pesewas
+        recipient: recipientCode,
+        reason,
+        reference
+      });
+
+      if (transferResponse.data.status && transferResponse.data.data.status === 'success') {
+        // Transfer successful
+        
+        // Update agent profit records - mark the exact amount as withdrawn
+        let remainingAmount = amount;
+        const profitsToUpdate = await AgentProfit.find({
+          agentId: req.user._id,
+          status: 'credited'
+        }).sort({ createdAt: 1 }); // Process oldest first
+
+        for (const profit of profitsToUpdate) {
+          if (remainingAmount <= 0) break;
+          
+          if (profit.profit <= remainingAmount) {
+            // Withdraw entire profit record
+            profit.status = 'withdrawn';
+            profit.withdrawnAt = new Date();
+            profit.withdrawalReference = reference;
+            await profit.save();
+            remainingAmount -= profit.profit;
+          } else {
+            // Partial withdrawal - split the record
+            const withdrawnAmount = remainingAmount;
+            const remainingProfit = profit.profit - withdrawnAmount;
+            
+            // Update original to withdrawn with partial amount
+            profit.profit = withdrawnAmount;
+            profit.status = 'withdrawn';
+            profit.withdrawnAt = new Date();
+            profit.withdrawalReference = reference;
+            await profit.save();
+            
+            // Create new record for remaining credited amount
+            await AgentProfit.create({
+              agentId: profit.agentId,
+              purchaseId: profit.purchaseId,
+              customerId: profit.customerId,
+              network: profit.network,
+              capacity: profit.capacity,
+              profit: remainingProfit,
+              status: 'credited',
+              creditedAt: profit.creditedAt
+            });
+            
+            remainingAmount = 0;
+          }
+        }
+
+        // Sync user's agentProfit field with actual balance
+        const newBalanceResult = await AgentProfit.aggregate([
+          {
+            $match: {
+              agentId: req.user._id,
+              status: 'credited'
+            }
+          },
+          {
+            $group: {
+              _id: null,
+              total: { $sum: '$profit' }
+            }
+          }
+        ]);
+        
+        req.user.agentProfit = newBalanceResult[0]?.total || 0;
+        await req.user.save();
+
+        // Update withdrawal record
+        withdrawal.status = 'completed';
+        withdrawal.gatewayResponse = transferResponse.data.data;
+        withdrawal.completedAt = new Date();
+        await withdrawal.save();
+
+        res.json({
+          success: true,
+          message: 'Withdrawal successful',
+          data: {
+            reference,
+            amount,
+            status: 'success',
+            transferCode: transferResponse.data.data.transfer_code,
+            remainingProfit: req.user.agentProfit
+          }
+        });
+
+      } else if (transferResponse.data.data.status === 'pending') {
+        // Transfer pending (requires OTP or approval)
+        withdrawal.status = 'processing';
+        withdrawal.gatewayResponse = transferResponse.data.data;
+        await withdrawal.save();
+
+        res.json({
+          success: true,
+          message: 'Withdrawal is being processed',
+          data: {
+            reference,
+            amount,
+            status: 'pending',
+            transferCode: transferResponse.data.data.transfer_code,
+            message: 'Your withdrawal is being processed and will be completed shortly'
+          }
+        });
+
+      } else {
+        // Transfer failed
+        throw new Error(transferResponse.data.message || 'Transfer failed');
+      }
+
+    } catch (transferError) {
+      // Update withdrawal record as failed
+      withdrawal.status = 'failed';
+      withdrawal.failureReason = transferError.response?.data?.message || transferError.message;
+      await withdrawal.save();
+
+      throw transferError;
+    }
+
+  } catch (error) {
+    console.error('Withdraw profit error:', error.response?.data || error);
+    res.status(500).json({
+      success: false,
+      message: error.response?.data?.message || 'Failed to process withdrawal',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Add this new route to sync profit balances
+router.post('/sync-profit-balance', protect, async (req, res) => {
+  try {
+    // Calculate actual credited profit from AgentProfit collection
+    const profitSum = await AgentProfit.aggregate([
       {
-        agentId: req.user._id,
-        status: 'credited'
+        $match: {
+          agentId: req.user._id,
+          status: 'credited'
+        }
       },
       {
-        status: 'withdrawn',
-        withdrawnAt: new Date(),
-        withdrawalReference: reference
+        $group: {
+          _id: null,
+          total: { $sum: '$profit' }
+        }
       }
-    );
+    ]);
+
+    const actualCreditedProfit = profitSum[0]?.total || 0;
+    
+    // Update user's agentProfit field to match
+    req.user.agentProfit = actualCreditedProfit;
+    await req.user.save();
+
+    console.log(`Synced profit balance for user ${req.user._id}: ${actualCreditedProfit}`);
 
     res.json({
       success: true,
-      message: 'Profit withdrawn to wallet successfully',
+      message: 'Profit balance synchronized',
       data: {
-        amount,
-        reference,
-        walletBalance: req.user.walletBalance,
-        remainingProfit: req.user.agentProfit,
-        previousWalletBalance: balanceBefore,
-        previousProfit: profitBefore
+        previousBalance: req.user.agentProfit,
+        syncedBalance: actualCreditedProfit,
+        userId: req.user._id
+      }
+    });
+  } catch (error) {
+    console.error('Sync profit balance error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to sync profit balance',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// 14. Webhook to handle Paystack transfer events
+router.post('/webhook/paystack', async (req, res) => {
+  try {
+    const config = await getPaystackConfig();
+    
+    // Verify webhook signature
+    const hash = crypto
+      .createHmac('sha512', config.secretKey)
+      .update(JSON.stringify(req.body))
+      .digest('hex');
+
+    if (hash !== req.headers['x-paystack-signature']) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid signature'
+      });
+    }
+
+    const { event, data } = req.body;
+
+    if (event === 'transfer.success') {
+      // Update transaction status
+      const transaction = await Transaction.findOne({
+        reference: data.reference
+      });
+
+      if (transaction && transaction.status === 'processing') {
+        transaction.status = 'completed';
+        transaction.completedAt = new Date();
+        transaction.gatewayResponse = data;
+        await transaction.save();
+
+        // Update user profit balance
+        const user = await User.findById(transaction.userId);
+        if (user) {
+          user.agentProfit -= transaction.amount;
+          await user.save();
+
+          // Update agent profit records
+          await AgentProfit.updateMany(
+            {
+              agentId: user._id,
+              status: 'credited'
+            },
+            {
+              status: 'withdrawn',
+              withdrawnAt: new Date(),
+              withdrawalReference: data.reference
+            }
+          );
+        }
+      }
+    } else if (event === 'transfer.failed' || event === 'transfer.reversed') {
+      // Handle failed or reversed transfer
+      const transaction = await Transaction.findOne({
+        reference: data.reference
+      });
+
+      if (transaction) {
+        transaction.status = 'failed';
+        transaction.failureReason = data.reason || 'Transfer failed';
+        transaction.gatewayResponse = data;
+        await transaction.save();
+      }
+    }
+
+    res.json({ success: true });
+
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Webhook processing failed'
+    });
+  }
+});
+
+// 15. Get withdrawal history
+router.get('/withdrawals', protect, async (req, res) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 20, 
+      status 
+    } = req.query;
+
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
+    const filter = {
+      userId: req.user._id,
+      type: 'agent_profit_withdrawal'
+    };
+
+    if (status) filter.status = status;
+
+    const withdrawals = await Transaction.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(parseInt(limit))
+      .skip(skip);
+
+    const total = await Transaction.countDocuments(filter);
+
+    res.json({
+      success: true,
+      data: withdrawals,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit))
       }
     });
 
   } catch (error) {
-    console.error('Withdraw profit error:', error);
+    console.error('Get withdrawals error:', error);
     res.status(500).json({
       success: false,
-      message: 'Failed to withdraw profit',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+      message: 'Failed to fetch withdrawals'
     });
   }
 });
 
 // ==================== ANALYTICS ROUTES ====================
 
-// 11. Get store analytics
+// 16. Get store analytics
 router.get('/analytics', protect, hasStore, async (req, res) => {
   try {
     const { period = '7days' } = req.query;
@@ -1012,7 +1576,7 @@ router.get('/analytics', protect, hasStore, async (req, res) => {
 
 // ==================== PUBLIC ROUTES ====================
 
-// 12. Get public store info - UPDATED TO INCLUDE WHATSAPP GROUP LINK
+// 17. Get public store info
 router.get('/public/:subdomain', async (req, res) => {
   try {
     const { subdomain } = req.params;
@@ -1043,7 +1607,7 @@ router.get('/public/:subdomain', async (req, res) => {
         logo: store.logo,
         bannerImage: store.bannerImage,
         whatsappNumber: store.whatsappNumber,
-        whatsappGroupLink: store.whatsappGroupLink, // Include WhatsApp group link
+        whatsappGroupLink: store.whatsappGroupLink,
         contactEmail: store.contactEmail,
         alternativePhone: store.alternativePhone,
         businessHours: store.businessHours,
@@ -1074,7 +1638,7 @@ router.get('/public/:subdomain', async (req, res) => {
   }
 });
 
-// 13. Get store products (public)
+// 18. Get store products (public)
 router.get('/public/:subdomain/products', async (req, res) => {
   try {
     const { subdomain } = req.params;
