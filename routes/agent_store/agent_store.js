@@ -958,7 +958,7 @@ router.post('/bank-account', protect, validateBankAccount, checkValidation, asyn
 });
 
 // 11. Get saved bank accounts
-router.get('/bank-accounts', protect, async (req, res) => {
+router.get('/bank-account', protect, async (req, res) => {
   try {
     if (!req.user.bankDetails) {
       return res.status(404).json({
@@ -982,6 +982,91 @@ router.get('/bank-accounts', protect, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Failed to fetch bank accounts'
+    });
+  }
+});
+// Validate Mobile Money Account
+router.post('/validate-momo', protect, async (req, res) => {
+  try {
+    const { phoneNumber, network } = req.body;
+    
+    if (!phoneNumber || !network) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone number and network are required'
+      });
+    }
+
+    // Validate Ghana phone number format
+    const phoneRegex = /^(\+233|0)[235]\d{8}$/;
+    if (!phoneRegex.test(phoneNumber)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid Ghana phone number format'
+      });
+    }
+
+    // Clean phone number (remove country code if present)
+    let cleanedNumber = phoneNumber;
+    if (phoneNumber.startsWith('+233')) {
+      cleanedNumber = '0' + phoneNumber.substring(4);
+    }
+
+    // Map network to Paystack mobile money codes
+    const networkMap = {
+      'mtn': 'MTN',
+      'vodafone': 'VOD', 
+      'telecel': 'VOD', // Vodafone became Telecel
+      'airteltigo': 'ATL'
+    };
+
+    const bankCode = networkMap[network.toLowerCase()];
+    if (!bankCode) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid network provider'
+      });
+    }
+
+    const paystackAPI = await getPaystackAPI();
+
+    try {
+      // Try to resolve the mobile money account
+      const response = await paystackAPI.get(
+        `/bank/resolve?account_number=${cleanedNumber}&bank_code=${bankCode}`
+      );
+
+      if (response.data.status) {
+        return res.json({
+          success: true,
+          data: {
+            accountName: response.data.data.account_name,
+            accountNumber: response.data.data.account_number,
+            isValid: true
+          }
+        });
+      }
+    } catch (error) {
+      console.log('MoMo validation error (expected for some providers):', error.message);
+    }
+
+    // If Paystack can't validate, return success with manual entry requirement
+    return res.json({
+      success: true,
+      data: {
+        accountName: null,
+        accountNumber: cleanedNumber,
+        isValid: true,
+        requiresManualName: true,
+        message: 'Please enter your registered mobile money name'
+      }
+    });
+
+  } catch (error) {
+    console.error('Validate MoMo error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to validate mobile money account'
     });
   }
 });
